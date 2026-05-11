@@ -51,6 +51,8 @@ bun run build
 x-bookmarks config init --client-id YOUR_CLIENT_ID
 x-bookmarks config status
 x-bookmarks auth login
+x-bookmarks auth login --no-open
+x-bookmarks auth login --manual
 x-bookmarks auth login --code RETURNED_CODE
 x-bookmarks auth login --callback-url 'http://127.0.0.1:8765/callback?code=...&state=...'
 x-bookmarks auth refresh
@@ -94,10 +96,11 @@ Live sync requires an X developer Project/App with OAuth 2.0 user-context access
 ```bash
 zig-out/bin/x-bookmarks config init --client-id YOUR_CLIENT_ID --redirect-uri http://127.0.0.1:8765/callback
 zig-out/bin/x-bookmarks auth login
-zig-out/bin/x-bookmarks auth login --callback-url 'http://127.0.0.1:8765/callback?code=...&state=...'
 zig-out/bin/x-bookmarks auth status
 zig-out/bin/x-bookmarks integration test --live --limit-pages 1
 ```
+
+`auth login` starts a temporary local web server for the configured redirect URI, opens the X authorization URL in the default browser when possible, captures the callback, exchanges the code, stores the OAuth token, and records the authenticated account locally. Use `--no-open` if you want the command to print the URL without launching a browser. Use `--manual`, `--code`, or `--callback-url` only as fallback flows.
 
 The token file is intentionally separate from config. `auth status` should report both access and refresh tokens as present before running live integration tests.
 
@@ -107,7 +110,7 @@ Implemented:
 
 - config discovery/init/status with XDG paths and repo-local `--home` support
 - SQLite migrations and local state for accounts, sync runs, raw pages, tweets, users, media, assets, bookmarks, folders, folder membership, and sync warnings
-- OAuth 2.0 PKCE login, confidential-client token exchange/refresh, token persistence, and `/2/users/me`
+- OAuth 2.0 PKCE login with local callback capture, confidential-client token exchange/refresh, token persistence, and `/2/users/me`
 - bookmark pagination sync with `--full`, normal incremental early-stop behavior, `--limit-pages`, `--max-results`, `--no-media`, `--download-media`, and `--wait-rate-limit`
 - progress output during sync page fetch/store/commit, asset download/reuse/failure, and folder sync
 - media/avatar downloads with idempotent source/hash reuse, preview-sized MP4 variant selection, missing-asset reconciliation, and asset verification
@@ -117,6 +120,6 @@ Implemented:
 
 Known limitations:
 
-- OAuth callback capture is paste-code or pasted-callback-URL based rather than a local callback server.
+- OAuth local callback capture requires an `http://127.0.0.1:PORT/path` or `http://localhost:PORT/path` redirect URI registered exactly in the X Developer Console.
 - The X bookmark API response used here exposes pagination, not a reliable account-wide total count before syncing. Run `sync --full` and then `bookmarks stats` to see the total imported/exposed locally.
 - Real X API integration tests require user credentials and are not enabled by default. Use `x-bookmarks integration test --live --limit-pages 1` only after configuring a real X developer app and OAuth token.

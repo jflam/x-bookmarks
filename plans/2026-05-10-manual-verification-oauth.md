@@ -140,20 +140,20 @@ Run:
 
 Expected behavior:
 
-1. The command prints an X authorization URL.
-2. It writes pending PKCE state to `data/oauth-token.json`.
-3. The pending token file includes a PKCE verifier and state. That file is local-only and ignored by git.
+1. The command writes pending PKCE state to `data/oauth-token.json`.
+2. It starts a temporary local web server for the configured redirect URI.
+3. It opens the X authorization URL in the default browser when possible.
+4. It captures the redirect callback, validates state, exchanges the code, writes the token file, and records the authenticated account.
 
 Expected output shape:
 
 ```text
-Open this authorization URL in a browser, then exchange the returned code with X OAuth 2.0.
-https://x.com/i/oauth2/authorize?...
-
-pending PKCE state written to: /Users/jflam/src/x-bookmarks/data/oauth-token.json
+listening for OAuth callback at http://127.0.0.1:8765/callback
+opened authorization URL in the default browser
+authenticated account: @USERNAME (USER_ID)
 ```
 
-Open the printed authorization URL in a browser.
+If browser auto-open is not available, run `auth login --no-open` and open the printed URL manually. The local callback is still captured automatically.
 
 ## Complete the Browser Authorization
 
@@ -168,22 +168,7 @@ In the browser:
 http://127.0.0.1:8765/callback?state=...&code=...
 ```
 
-The current CLI does not run a local callback server during login. Your browser may show a connection error after the redirect. That is fine. The important part is the full URL in the browser address bar.
-
-Copy the entire callback URL from the browser address bar. Prefer the full callback URL over copying only the code, because the CLI validates the OAuth `state` value when `--callback-url` is used.
-
-Exchange the callback URL immediately. X authorization codes are short-lived.
-
-Run:
-
-```bash
-./zig-out/bin/x-bookmarks --home data auth login \
-  --callback-url 'PASTE_THE_FULL_CALLBACK_URL_HERE'
-```
-
-Use single quotes around the URL so shell characters like `&` are not interpreted.
-
-Expected success output:
+The local callback page should say the callback was received. Return to the terminal for the final success output:
 
 ```text
 authenticated account: @USERNAME (USER_ID)
@@ -388,9 +373,12 @@ If refresh token is missing, repeat OAuth after confirming `offline.access` is c
 
 ### Browser shows "site cannot be reached"
 
-This is expected after X redirects to `127.0.0.1:8765`. Copy the full URL from the address bar and pass it to:
+This usually means `auth login` was not still running, the redirect URI in X does not exactly match config, or the local port was blocked. Restart the login flow and make sure the terminal says it is listening before approving in the browser.
+
+As a fallback, use the manual flow:
 
 ```bash
+./zig-out/bin/x-bookmarks --home data auth login --manual
 ./zig-out/bin/x-bookmarks --home data auth login --callback-url 'FULL_URL'
 ```
 

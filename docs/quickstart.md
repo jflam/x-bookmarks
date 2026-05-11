@@ -14,6 +14,40 @@ For the normal installed state, omit `--home data`:
 ./zig-out/bin/x-bookmarks ...
 ```
 
+## Authenticate With X
+
+Configure the X OAuth client ID and the exact localhost redirect URI registered in the X Developer Console:
+
+```sh
+./zig-out/bin/x-bookmarks --home data config init --client-id YOUR_CLIENT_ID --redirect-uri http://127.0.0.1:8765/callback
+```
+
+If your app is configured as a confidential web app, add `x.client_secret` to the generated config file before logging in. Keep that file local and out of git.
+
+Run the browser-based OAuth flow with one command:
+
+```sh
+./zig-out/bin/x-bookmarks --home data auth login
+```
+
+The command starts a temporary local web server for the configured redirect URI, opens the X authorization URL in your default browser when possible, captures the callback, exchanges the authorization code, writes the token file, and records the authenticated account locally.
+
+If browser auto-open is not available:
+
+```sh
+./zig-out/bin/x-bookmarks --home data auth login --no-open
+```
+
+Then open the printed URL manually in a browser. The local callback is still captured automatically.
+
+Confirm the token:
+
+```sh
+./zig-out/bin/x-bookmarks --home data auth status
+```
+
+`auth status` should report both access and refresh tokens as present.
+
 ## Check Current Local State
 
 Use local stats to see how many bookmarks are currently stored:

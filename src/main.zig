@@ -269,7 +269,7 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] config init [--force] [--client-id VALUE] [--redirect-uri URI]
         \\  x-bookmarks [--config PATH] [--home PATH] config status
         \\  x-bookmarks [--config PATH] [--home PATH] db init|status
-        \\  x-bookmarks [--config PATH] [--home PATH] auth login [--code CODE | --callback-url URL]
+        \\  x-bookmarks [--config PATH] [--home PATH] auth login [--manual|--no-open|--code CODE|--callback-url URL]
         \\  x-bookmarks [--config PATH] [--home PATH] auth status|refresh
         \\  x-bookmarks [--config PATH] [--home PATH] sync [--full] [--yolo|--yes] [--wait-rate-limit] [--limit-pages N] [--max-results N] [--no-media|--download-media]
         \\  x-bookmarks [--config PATH] [--home PATH] export --format jsonl
@@ -374,13 +374,19 @@ fn commandAuth(rt: *Runtime) !void {
     } else if (std.mem.eql(u8, sub, "login")) {
         var code: ?[]const u8 = null;
         var callback_state: ?[]const u8 = null;
+        var manual = false;
+        var open_browser = true;
         var owned_code: ?[]const u8 = null;
         defer if (owned_code) |value| rt.allocator.free(value);
         var owned_callback_state: ?[]const u8 = null;
         defer if (owned_callback_state) |value| rt.allocator.free(value);
         var i = rt.command_index + 2;
         while (i < rt.args.len) : (i += 1) {
-            if (std.mem.eql(u8, rt.args[i], "--code")) {
+            if (std.mem.eql(u8, rt.args[i], "--manual")) {
+                manual = true;
+            } else if (std.mem.eql(u8, rt.args[i], "--no-open")) {
+                open_browser = false;
+            } else if (std.mem.eql(u8, rt.args[i], "--code")) {
                 if (code != null) return AppError.InvalidArguments;
                 i += 1;
                 if (i >= rt.args.len) return AppError.InvalidArguments;
@@ -397,7 +403,14 @@ fn commandAuth(rt: *Runtime) !void {
                 return AppError.InvalidArguments;
             }
         }
-        if (code) |value| try authLoginExchange(rt.allocator, cfg, value, callback_state) else try authLoginStart(rt.allocator, cfg);
+        if (manual and code != null) return AppError.InvalidArguments;
+        if (code) |value| {
+            try authLoginExchange(rt.allocator, cfg, value, callback_state);
+        } else if (manual) {
+            try authLoginStart(rt.allocator, cfg);
+        } else {
+            try authLoginInteractive(rt.allocator, cfg, open_browser);
+        }
     } else if (std.mem.eql(u8, sub, "refresh")) {
         var token = try loadToken(rt.allocator, cfg.token_path);
         defer token.deinit(rt.allocator);
@@ -450,6 +463,24 @@ fn authStatus(allocator: std.mem.Allocator, cfg: Config) !void {
 }
 
 fn authLoginStart(allocator: std.mem.Allocator, cfg: Config) !void {
+    const auth_url = try authLoginPrepare(allocator, cfg);
+    defer allocator.free(auth_url);
+
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.writeAll("Open this authorization URL in a browser, then exchange the returned code with X OAuth 2.0.\n");
+    try out.print("{s}\n\n", .{auth_url});
+    try out.print("pending PKCE state written to: {s}\n", .{cfg.token_path});
+}
+
+fn authLoginInteractive(allocator: std.mem.Allocator, cfg: Config, open_browser: bool) !void {
+    const auth_url = try authLoginPrepare(allocator, cfg);
+    defer allocator.free(auth_url);
+    const callback = try waitForOAuthCallback(allocator, cfg.redirect_uri, auth_url, open_browser);
+    defer callback.deinit(allocator);
+    try authLoginExchange(allocator, cfg, callback.code, callback.state);
+}
+
+fn authLoginPrepare(allocator: std.mem.Allocator, cfg: Config) ![]const u8 {
     if (std.mem.eql(u8, cfg.client_id, "your-client-id") or cfg.client_id.len == 0) {
         std.debug.print("config is missing x.client_id\n", .{});
         return AppError.ConfigInvalid;
@@ -463,7 +494,7 @@ fn authLoginStart(allocator: std.mem.Allocator, cfg: Config) !void {
     const scope_joined = try joinScopes(allocator, cfg.scopes, " ");
     defer allocator.free(scope_joined);
     const auth_url = try buildAuthUrl(allocator, cfg.client_id, cfg.redirect_uri, scope_joined, state, challenge);
-    defer allocator.free(auth_url);
+    errdefer allocator.free(auth_url);
 
     try ensureParentDir(cfg.token_path);
     const created = try timestampString(allocator);
@@ -483,10 +514,7 @@ fn authLoginStart(allocator: std.mem.Allocator, cfg: Config) !void {
     defer allocator.free(pending);
     try writePrivateFile(cfg.token_path, pending);
 
-    const out = std.fs.File.stdout().deprecatedWriter();
-    try out.writeAll("Open this authorization URL in a browser, then exchange the returned code with X OAuth 2.0.\n");
-    try out.print("{s}\n\n", .{auth_url});
-    try out.print("pending PKCE state written to: {s}\n", .{cfg.token_path});
+    return auth_url;
 }
 
 fn authLoginExchange(allocator: std.mem.Allocator, cfg: Config, code: []const u8, callback_state: ?[]const u8) !void {
@@ -572,6 +600,118 @@ fn authLoginExchange(allocator: std.mem.Allocator, cfg: Config, code: []const u8
     defer allocator.free(token_json);
     try writePrivateFile(cfg.token_path, token_json);
     try std.fs.File.stdout().deprecatedWriter().print("authenticated account: @{s} ({s})\n", .{ account.username, account.user_id });
+}
+
+const OAuthCallback = struct {
+    code: []const u8,
+    state: []const u8,
+
+    fn deinit(self: OAuthCallback, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.state);
+    }
+};
+
+const LocalRedirect = struct {
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+
+    fn deinit(self: LocalRedirect, allocator: std.mem.Allocator) void {
+        allocator.free(self.host);
+        allocator.free(self.path);
+    }
+};
+
+fn waitForOAuthCallback(allocator: std.mem.Allocator, redirect_uri: []const u8, auth_url: []const u8, open_browser: bool) !OAuthCallback {
+    const redirect = try parseLocalHttpRedirectUri(allocator, redirect_uri);
+    defer redirect.deinit(allocator);
+    const listen_host = if (std.mem.eql(u8, redirect.host, "localhost")) "127.0.0.1" else redirect.host;
+    const address = try std.net.Address.parseIp4(listen_host, redirect.port);
+    var server = try address.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("listening for OAuth callback at {s}\n", .{redirect_uri});
+    if (open_browser and openUrlInBrowser(allocator, auth_url)) {
+        try out.writeAll("opened authorization URL in the default browser\n");
+    } else {
+        try out.writeAll("open this authorization URL in a browser:\n");
+        try out.print("{s}\n", .{auth_url});
+    }
+
+    while (true) {
+        var conn = try server.accept();
+        defer conn.stream.close();
+        var buf: [8192]u8 = undefined;
+        const n = try conn.stream.read(&buf);
+        if (n == 0) continue;
+        const req = buf[0..n];
+        const target = parseHttpTarget(req) orelse {
+            try writeOAuthCallbackResponse(&conn.stream, .bad_request, "Invalid OAuth callback request.");
+            continue;
+        };
+        const path = httpTargetPath(target);
+        if (!std.mem.eql(u8, path, redirect.path)) {
+            try writeOAuthCallbackResponse(&conn.stream, .not_found, "This local server is waiting for the X OAuth callback.");
+            continue;
+        }
+        if (callbackParamFromUrl(allocator, target, "error")) |oauth_error| {
+            defer allocator.free(oauth_error);
+            try writeOAuthCallbackResponse(&conn.stream, .bad_request, "X OAuth authorization was cancelled or failed. You can close this tab.");
+            std.debug.print("OAuth callback returned error: {s}\n", .{oauth_error});
+            return AppError.AuthRequired;
+        } else |_| {}
+
+        const code = callbackParamFromUrl(allocator, target, "code") catch {
+            try writeOAuthCallbackResponse(&conn.stream, .bad_request, "OAuth callback was missing the authorization code.");
+            continue;
+        };
+        errdefer allocator.free(code);
+        const state = callbackParamFromUrl(allocator, target, "state") catch {
+            allocator.free(code);
+            try writeOAuthCallbackResponse(&conn.stream, .bad_request, "OAuth callback was missing state.");
+            continue;
+        };
+        errdefer allocator.free(state);
+        try writeOAuthCallbackResponse(&conn.stream, .ok, "OAuth callback received. You can close this tab and return to the terminal.");
+        return .{ .code = code, .state = state };
+    }
+}
+
+fn writeOAuthCallbackResponse(stream: anytype, status: std.http.Status, message: []const u8) !void {
+    const reason = switch (status) {
+        .ok => "OK",
+        .bad_request => "Bad Request",
+        .not_found => "Not Found",
+        else => "OK",
+    };
+    const html_prefix =
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>x-bookmarks OAuth</title></head><body><h1>x-bookmarks</h1><p>";
+    const html_suffix = "</p></body></html>";
+    const len = html_prefix.len + message.len + html_suffix.len;
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 {} {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ @intFromEnum(status), reason, len });
+    try stream.writeAll(header);
+    try stream.writeAll(html_prefix);
+    try stream.writeAll(message);
+    try stream.writeAll(html_suffix);
+}
+
+fn openUrlInBrowser(allocator: std.mem.Allocator, url: []const u8) bool {
+    const argv: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &.{ "open", url },
+        .linux => &.{ "xdg-open", url },
+        .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", url },
+        else => return false,
+    };
+    const result = std.process.Child.run(.{ .allocator = allocator, .argv = argv, .max_output_bytes = 1024 }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn commandSync(rt: *Runtime) !void {
@@ -3649,13 +3789,21 @@ fn parseHttpMethod(req: []const u8) ?[]const u8 {
     return req[0..end];
 }
 
-fn parseHttpPath(req: []const u8) ?[]const u8 {
+fn parseHttpTarget(req: []const u8) ?[]const u8 {
     const method_end = std.mem.indexOfScalar(u8, req, ' ') orelse return null;
     const method = req[0..method_end];
     if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) return null;
     const rest = req[method_end + 1 ..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
-    const target = rest[0..end];
+    return rest[0..end];
+}
+
+fn parseHttpPath(req: []const u8) ?[]const u8 {
+    const target = parseHttpTarget(req) orelse return null;
+    return httpTargetPath(target);
+}
+
+fn httpTargetPath(target: []const u8) []const u8 {
     const query = std.mem.indexOfAny(u8, target, "?#") orelse target.len;
     return target[0..query];
 }
@@ -3829,6 +3977,31 @@ fn buildAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, redirect_ur
     const ch = try urlEncode(allocator, challenge);
     defer allocator.free(ch);
     return std.fmt.allocPrint(allocator, "https://x.com/i/oauth2/authorize?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&state={s}&code_challenge={s}&code_challenge_method=S256", .{ cid, redir, scope, st, ch });
+}
+
+fn parseLocalHttpRedirectUri(allocator: std.mem.Allocator, redirect_uri: []const u8) !LocalRedirect {
+    const prefix = "http://";
+    if (!std.mem.startsWith(u8, redirect_uri, prefix)) return AppError.ConfigInvalid;
+    const rest = redirect_uri[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return AppError.ConfigInvalid;
+    const host_port = rest[0..slash];
+    if (host_port.len == 0) return AppError.ConfigInvalid;
+    const path_and_query = rest[slash..];
+    const path_end = std.mem.indexOfAny(u8, path_and_query, "?#") orelse path_and_query.len;
+    const path = path_and_query[0..path_end];
+    if (path.len == 0 or path[0] != '/') return AppError.ConfigInvalid;
+
+    const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
+    const host = if (colon) |idx| host_port[0..idx] else host_port;
+    const port_text = if (colon) |idx| host_port[idx + 1 ..] else "80";
+    if (!std.mem.eql(u8, host, "127.0.0.1") and !std.mem.eql(u8, host, "localhost")) return AppError.ConfigInvalid;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return AppError.ConfigInvalid;
+    if (port == 0) return AppError.ConfigInvalid;
+    return .{
+        .host = try allocator.dupe(u8, host),
+        .port = port,
+        .path = try allocator.dupe(u8, path),
+    };
 }
 
 fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -4284,6 +4457,18 @@ test "callback URL parser extracts and decodes OAuth code without logging callba
     try std.testing.expectEqualStrings("abc 1", state);
 }
 
+test "local OAuth redirect URI parser requires loopback http callback" {
+    const allocator = std.testing.allocator;
+    const redirect = try parseLocalHttpRedirectUri(allocator, "http://127.0.0.1:8765/callback?ignored=1");
+    defer redirect.deinit(allocator);
+
+    try std.testing.expectEqualStrings("127.0.0.1", redirect.host);
+    try std.testing.expectEqual(@as(u16, 8765), redirect.port);
+    try std.testing.expectEqualStrings("/callback", redirect.path);
+    try std.testing.expectError(AppError.ConfigInvalid, parseLocalHttpRedirectUri(allocator, "https://127.0.0.1:8765/callback"));
+    try std.testing.expectError(AppError.ConfigInvalid, parseLocalHttpRedirectUri(allocator, "http://example.com:8765/callback"));
+}
+
 test "callback state validation rejects mismatched OAuth state" {
     const allocator = std.testing.allocator;
     var pending = try std.json.parseFromSlice(std.json.Value, allocator, "{\"state\":\"expected-state\"}", .{});
@@ -4366,6 +4551,7 @@ test "numeric CLI argument parsing maps malformed values to invalid arguments" {
 
 test "viewer server parses request paths and content types for exported assets" {
     try std.testing.expectEqualStrings("/data/bookmarks.json", parseHttpPath("GET /data/bookmarks.json?cache=1 HTTP/1.1\r\n").?);
+    try std.testing.expectEqualStrings("/callback?code=abc&state=xyz", parseHttpTarget("GET /callback?code=abc&state=xyz HTTP/1.1\r\n").?);
     try std.testing.expectEqualStrings("/assets/media/movie.mp4", parseHttpPath("HEAD /assets/media/movie.mp4 HTTP/1.1\r\n").?);
     try std.testing.expectEqualStrings("/assets/media/photo.webp", parseHttpPath("GET /assets/media/photo.webp#ignored HTTP/1.1\r\n").?);
     try std.testing.expectEqualStrings("application/json", contentType("bookmarks.json"));
