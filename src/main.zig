@@ -274,6 +274,8 @@ fn run() !void {
         try commandAssets(&rt);
     } else if (std.mem.eql(u8, cmd, "obsidian")) {
         try commandObsidian(&rt);
+    } else if (std.mem.eql(u8, cmd, "kb")) {
+        try commandKb(&rt);
     } else if (std.mem.eql(u8, cmd, "integration")) {
         try commandIntegration(&rt);
     } else if (std.mem.eql(u8, cmd, "bookmarks")) {
@@ -337,6 +339,9 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] obsidian status
         \\  x-bookmarks [--config PATH] [--home PATH] obsidian export [--mode timeline-only|full] [--changed] [--dry-run] [--clean-stale] [--vault PATH]
         \\  x-bookmarks [--config PATH] [--home PATH] obsidian migrate-media [--dry-run|--remove-local-videos]
+        \\  x-bookmarks [--config PATH] [--home PATH] kb init
+        \\  x-bookmarks [--config PATH] [--home PATH] kb export-raw-x [--changed]
+        \\  x-bookmarks [--config PATH] [--home PATH] kb status
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks list [--limit N]
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks stats
         \\  x-bookmarks [--config PATH] [--home PATH] integration test --live [--limit-pages N] [--max-results N] [--no-media]
@@ -1025,6 +1030,44 @@ fn obsidianInitCommand(rt: *Runtime) !void {
     }
     try writeObsidianConfig(rt.allocator, paths.config_path, vault_path, cfg.obsidian_root_dir);
     try std.fs.File.stdout().deprecatedWriter().print("initialized Obsidian export root: {s}\n", .{resolved.root});
+}
+
+fn commandKb(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "kb");
+    const cfg = try loadRuntimeConfig(rt);
+    if (std.mem.eql(u8, sub, "init")) {
+        if (rt.command_index + 2 != rt.args.len) return AppError.InvalidArguments;
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbInit(rt.allocator, paths);
+    } else if (std.mem.eql(u8, sub, "export-raw-x")) {
+        var changed_only = false;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--changed")) {
+                changed_only = true;
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        const stats = try kbExportRawX(&db, rt.allocator, paths, changed_only);
+        try std.fs.File.stdout().deprecatedWriter().print("kb raw X export: total={} written={} skipped={} processed={}\n", .{ stats.total, stats.written, stats.skipped_unchanged, stats.skipped_processed });
+    } else if (std.mem.eql(u8, sub, "status")) {
+        if (rt.command_index + 2 != rt.args.len) return AppError.InvalidArguments;
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbStatus(&db, rt.allocator, paths);
+    } else {
+        return AppError.InvalidCommand;
+    }
 }
 
 fn commandAssets(rt: *Runtime) !void {
@@ -4090,6 +4133,563 @@ fn makeObsidianFullDirs(paths: ObsidianPaths) !void {
     try std.fs.cwd().makePath(paths.avatars);
 }
 
+const KbExportStats = struct {
+    total: u32 = 0,
+    written: u32 = 0,
+    skipped_unchanged: u32 = 0,
+    skipped_processed: u32 = 0,
+};
+
+const kbSchemaStarter =
+    \\# Wiki Schema
+    \\
+    \\This knowledge base follows the LLM Wiki pattern: raw sources are immutable inputs, and the wiki is the compiled Markdown artifact maintained by an agent.
+    \\
+    \\## Directory Contract
+    \\
+    \\- `raw/x/inbox/`: bookmarked X posts waiting for ingestion.
+    \\- `raw/x/ingested/`: raw X posts already incorporated into the wiki.
+    \\- `raw/x/ignored/`: raw X posts reviewed and intentionally skipped.
+    \\- `raw/web/`, `raw/papers/`, `raw/repos/`, `raw/images/`: follow-up sources collected outside the bookmark API.
+    \\- `wiki/`: agent-maintained pages, indexes, logs, syntheses, and outputs.
+    \\
+    \\Raw files should not be rewritten for synthesis. The only acceptable raw-source mutation during ingestion is status/move bookkeeping.
+    \\
+    \\## Page Types
+    \\
+    \\Use these wiki page families:
+    \\
+    \\- `concepts/`: durable ideas, patterns, techniques, and claims.
+    \\- `people/`: authors, researchers, builders, and recurring experts.
+    \\- `projects/`: products, repos, apps, and named projects.
+    \\- `tools/`: specific tools or technical utilities.
+    \\- `papers/`: papers and formal source documents.
+    \\- `companies/`: organizations and labs.
+    \\- `questions/`: unresolved questions worth revisiting.
+    \\- `syntheses/`: compiled answers or essays that should persist.
+    \\- `outputs/`: health checks, query outputs, and temporary reports.
+    \\
+    \\## Frontmatter
+    \\
+    \\Every wiki page should start with frontmatter:
+    \\
+    \\```yaml
+    \\---
+    \\type: concept
+    \\status: active
+    \\created: 2026-05-11
+    \\updated: 2026-05-11
+    \\source_count: 1
+    \\tags: []
+    \\---
+    \\```
+    \\
+    \\Valid `type` values are `concept`, `person`, `project`, `tool`, `paper`, `company`, `question`, `synthesis`, and `output`.
+    \\
+    \\## Citation Style
+    \\
+    \\Every factual claim should cite raw files or related wiki pages. Prefer Obsidian links:
+    \\
+    \\```markdown
+    \\This pattern treats the wiki as a compiled artifact rather than a retrieval index. Sources: [[../raw/x/ingested/2052423637500571963]], [[concepts/llm-agent-memory]].
+    \\```
+    \\
+    \\When citing a raw X bookmark before moving it, link to `../raw/x/inbox/<tweet_id>`. After processing, move the raw file to `../raw/x/ingested/<tweet_id>` or `../raw/x/ignored/<tweet_id>` and update citations if needed.
+    \\
+    \\## Ingestion Workflow
+    \\
+    \\1. Read this schema.
+    \\2. Read `wiki/index.md` to understand existing pages.
+    \\3. Select files from `raw/x/inbox/`.
+    \\4. For each raw bookmark, determine the core subject and search the wiki for related pages.
+    \\5. Decide whether to create a page, update a page, add evidence, record a contradiction/caveat, request follow-up source collection, or ignore the source.
+    \\6. Update relevant wiki pages with citations and backlinks.
+    \\7. Update `wiki/index.md`.
+    \\8. Append a structured entry to `wiki/log.md`.
+    \\9. Move each processed raw X file to `raw/x/ingested/` or `raw/x/ignored/`.
+    \\
+    \\Prefer updating existing pages over creating duplicates. A high-signal source may touch many pages; a low-signal source may be ignored with a short reason in the log.
+    \\
+    \\## Page Structure
+    \\
+    \\Use this default shape for concept/entity pages:
+    \\
+    \\```markdown
+    \\# Page Title
+    \\
+    \\## Summary
+    \\
+    \\One or two paragraphs that state the durable idea.
+    \\
+    \\## Notes
+    \\
+    \\- Specific claims, each with citations.
+    \\
+    \\## Examples / Evidence
+    \\
+    \\- Bookmark, article, paper, or repo evidence with links.
+    \\
+    \\## Contradictions / Caveats
+    \\
+    \\- Conflicting evidence, stale assumptions, or uncertainty.
+    \\
+    \\## Related
+    \\
+    \\- [[other-page]]
+    \\```
+    \\
+    \\## Ingestion Example
+    \\
+    \\Before:
+    \\
+    \\- Raw source: `raw/x/inbox/2052423637500571963.md`
+    \\- The post describes agent memory and links to a fuller article.
+    \\
+    \\After:
+    \\
+    \\- Update `wiki/concepts/llm-agent-memory.md` with the new claim and a citation to `[[../raw/x/ingested/2052423637500571963]]`.
+    \\- Create `wiki/questions/how-should-agent-memory-handle-stale-claims.md` if the source raises an unresolved issue.
+    \\- Add both pages to `wiki/index.md`.
+    \\- Append an ingest entry to `wiki/log.md`.
+    \\- Move the raw source from `raw/x/inbox/` to `raw/x/ingested/`.
+    \\
+    \\## Index Rules
+    \\
+    \\Update `wiki/index.md` on every ingest. Include page path, one-line summary, page type, source count, and last updated date.
+    \\
+    \\## Log Rules
+    \\
+    \\Append to `wiki/log.md` on every ingest, query, or lint pass. Use stable headings:
+    \\
+    \\```markdown
+    \\## [2026-05-11] ingest | X bookmark 2052423637500571963
+    \\
+    \\- Raw source: [[../raw/x/ingested/2052423637500571963]]
+    \\- Updated: [[concepts/llm-agent-memory]]
+    \\- Created: [[questions/how-should-agent-maintained-wikis-handle-contradictions]]
+    \\- Notes: Added distinction between RAG retrieval and compiled persistent wiki.
+    \\```
+    \\
+    \\## Query Workflow
+    \\
+    \\Answer from the compiled wiki first. Read raw sources only when citations need verification or the wiki is thin. If the answer is worth preserving, write it to `wiki/syntheses/` or `wiki/outputs/`, update the index, and append the log.
+    \\
+    \\## Lint Workflow
+    \\
+    \\Health checks should look for duplicate pages, missing citations, orphan pages, stale claims, contradictions, raw inbox backlog, and high-signal sources that received shallow treatment. Write reports to `wiki/outputs/wiki-health-YYYY-MM-DD.md` and append the log.
+    \\
+;
+
+const kbIndexStarter =
+    \\# Wiki Index
+    \\
+    \\This is the navigation catalog for the agent and user. Update it on every ingest.
+    \\
+    \\## Concepts
+    \\
+    \\## People
+    \\
+    \\## Projects
+    \\
+    \\## Tools
+    \\
+    \\## Papers
+    \\
+    \\## Companies
+    \\
+    \\## Open Questions
+    \\
+    \\## Syntheses
+    \\
+;
+
+const kbLogStarter =
+    \\# Wiki Log
+    \\
+    \\Append-only chronological record of ingestion, query, and lint passes.
+    \\
+;
+
+fn kbInit(allocator: std.mem.Allocator, paths: ObsidianPaths) !void {
+    try makeKbDirs(allocator, paths);
+
+    const schema_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "schema.md" });
+    defer allocator.free(schema_path);
+    const index_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "index.md" });
+    defer allocator.free(index_path);
+    const log_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "log.md" });
+    defer allocator.free(log_path);
+
+    try writeFileIfMissing(schema_path, kbSchemaStarter);
+    try writeFileIfMissing(index_path, kbIndexStarter);
+    try writeFileIfMissing(log_path, kbLogStarter);
+    if (!builtin.is_test) try std.fs.File.stdout().deprecatedWriter().print("initialized knowledge base: {s}\n", .{paths.root});
+}
+
+fn makeKbDirs(allocator: std.mem.Allocator, paths: ObsidianPaths) !void {
+    const dirs = [_][]const u8{
+        "raw/x/inbox",
+        "raw/x/ingested",
+        "raw/x/ignored",
+        "raw/web",
+        "raw/papers",
+        "raw/repos",
+        "raw/images",
+        "wiki/concepts",
+        "wiki/people",
+        "wiki/projects",
+        "wiki/tools",
+        "wiki/papers",
+        "wiki/companies",
+        "wiki/questions",
+        "wiki/syntheses",
+        "wiki/outputs",
+    };
+    for (dirs) |dir| {
+        const path = try std.fs.path.join(allocator, &.{ paths.root, dir });
+        defer allocator.free(path);
+        try std.fs.cwd().makePath(path);
+    }
+}
+
+fn writeFileIfMissing(path: []const u8, data: []const u8) !void {
+    if (fileExists(path)) return;
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+}
+
+fn kbStatus(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths) !void {
+    const inbox = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox" });
+    defer allocator.free(inbox);
+    const ingested = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ingested" });
+    defer allocator.free(ingested);
+    const ignored = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ignored" });
+    defer allocator.free(ignored);
+    const wiki = try std.fs.path.join(allocator, &.{ paths.root, "wiki" });
+    defer allocator.free(wiki);
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("kb root: {s}\n", .{paths.root});
+    try out.print("active bookmarks: {}\n", .{try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1")});
+    try out.print("raw x inbox: {}\n", .{try countFilesWithSuffix(allocator, inbox, ".md")});
+    try out.print("raw x ingested: {}\n", .{try countFilesWithSuffix(allocator, ingested, ".md")});
+    try out.print("raw x ignored: {}\n", .{try countFilesWithSuffix(allocator, ignored, ".md")});
+    try out.print("wiki pages: {}\n", .{try countMarkdownFilesRecursive(allocator, wiki)});
+}
+
+fn countMarkdownFilesRecursive(allocator: std.mem.Allocator, root: []const u8) !i64 {
+    var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var count: i64 = 0;
+    while (try it.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            count += 1;
+        } else if (entry.kind == .directory) {
+            const child = try std.fs.path.join(allocator, &.{ root, entry.name });
+            defer allocator.free(child);
+            count += try countMarkdownFilesRecursive(allocator, child);
+        }
+    }
+    return count;
+}
+
+fn kbExportRawX(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, changed_only: bool) !KbExportStats {
+    try makeKbDirs(allocator, paths);
+    var stats = KbExportStats{};
+    const stmt = try db.prepare(
+        \\SELECT b.tweet_id, coalesce(t.canonical_uri, ''), coalesce(t.twitter_uri, ''), coalesce(t.text, ''),
+        \\       coalesce(t.created_at, ''), coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''),
+        \\       b.first_seen_at, t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        stats.total += 1;
+        const tweet_id = colText(stmt, 0);
+        if (try kbRawXProcessedPathExists(allocator, paths, tweet_id)) {
+            stats.skipped_processed += 1;
+            continue;
+        }
+        const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
+        defer allocator.free(filename);
+        const path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", filename });
+        defer allocator.free(path);
+        const data = try buildRawXBookmarkMarkdown(
+            db,
+            allocator,
+            tweet_id,
+            colText(stmt, 1),
+            colText(stmt, 2),
+            colText(stmt, 3),
+            colText(stmt, 4),
+            colText(stmt, 5),
+            colText(stmt, 6),
+            colText(stmt, 7),
+            colText(stmt, 8),
+            colText(stmt, 9),
+        );
+        defer allocator.free(data);
+        if (try writeKbRawFile(allocator, path, data, changed_only)) {
+            stats.written += 1;
+        } else {
+            stats.skipped_unchanged += 1;
+        }
+    }
+    return stats;
+}
+
+fn kbRawXProcessedPathExists(allocator: std.mem.Allocator, paths: ObsidianPaths, tweet_id: []const u8) !bool {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
+    defer allocator.free(filename);
+    const ingested = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ingested", filename });
+    defer allocator.free(ingested);
+    if (fileExists(ingested)) return true;
+    const ignored = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ignored", filename });
+    defer allocator.free(ignored);
+    return fileExists(ignored);
+}
+
+fn writeKbRawFile(allocator: std.mem.Allocator, path: []const u8, data: []const u8, changed_only: bool) !bool {
+    if (changed_only and fileExists(path)) {
+        const existing = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+        defer allocator.free(existing);
+        if (std.mem.eql(u8, existing, data)) return false;
+    }
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+    return true;
+}
+
+fn buildRawXBookmarkMarkdown(
+    db: *Db,
+    allocator: std.mem.Allocator,
+    tweet_id: []const u8,
+    canonical_uri: []const u8,
+    twitter_uri: []const u8,
+    stored_text: []const u8,
+    created_at: []const u8,
+    author_id: []const u8,
+    username: []const u8,
+    author_name: []const u8,
+    bookmarked_at: []const u8,
+    raw_json: []const u8,
+) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch null;
+    defer if (parsed) |*p| p.deinit();
+    const root = if (parsed) |p| p.value else null;
+    const post_text = rawXPostText(root, stored_text);
+    var urls = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = urls.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        urls.deinit();
+    }
+    if (root) |value| try collectTweetUrls(allocator, value, &urls);
+
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll("---\n");
+    try yamlString(w, "source_type", "x_bookmark");
+    try yamlString(w, "tweet_id", tweet_id);
+    try yamlString(w, "canonical_url", canonical_uri);
+    try yamlString(w, "twitter_url", twitter_uri);
+    try yamlString(w, "author_username", username);
+    try yamlString(w, "author_name", author_name);
+    try yamlString(w, "author_id", author_id);
+    try yamlString(w, "created_at", created_at);
+    try yamlString(w, "bookmarked_at", bookmarked_at);
+    try yamlStringArrayForQuery(db, allocator, w, "folders", "SELECT coalesce(f.name, bfi.folder_id) FROM bookmark_folder_items bfi LEFT JOIN bookmark_folders f ON f.account_user_id=bfi.account_user_id AND f.folder_id=bfi.folder_id WHERE bfi.tweet_id=? ORDER BY f.name, bfi.folder_id", tweet_id);
+    try yamlString(w, "status", "inbox");
+    try w.writeAll("---\n\n");
+    try w.print("# X Bookmark: @{s} / {s}\n\n", .{ if (username.len > 0) username else "unknown", tweet_id });
+    try w.writeAll("## Post\n\n");
+    if (post_text.len > 0) {
+        try writeMarkdownEscaped(w, post_text);
+        try w.writeAll("\n\n");
+    } else {
+        try w.writeAll("_No post text stored._\n\n");
+    }
+    try writeRawWhyThisMayMatter(db, allocator, w, tweet_id, author_id, root, &urls);
+    try writeRawLinksSection(w, canonical_uri, twitter_uri, &urls);
+    try writeRawQuotePostSection(db, allocator, w, root);
+    try writeRawMediaSection(db, w, tweet_id);
+    try w.writeAll("## Raw Metadata\n\n```json\n");
+    try w.writeAll(raw_json);
+    try w.writeAll("\n```\n");
+    return out.toOwnedSlice(allocator);
+}
+
+fn rawXPostText(root: ?std.json.Value, fallback: []const u8) []const u8 {
+    if (root) |value| {
+        if (getObject(value, "note_tweet")) |note| {
+            if (getString(note, "text")) |text| return text;
+        }
+        if (getString(value, "text")) |text| return text;
+    }
+    return fallback;
+}
+
+fn collectTweetUrls(allocator: std.mem.Allocator, tweet: std.json.Value, urls: *std.StringHashMap(void)) !void {
+    if (getObject(tweet, "entities")) |entities| try collectUrlsFromEntities(allocator, entities, urls);
+    if (getObject(tweet, "note_tweet")) |note| {
+        if (getObject(note, "entities")) |entities| try collectUrlsFromEntities(allocator, entities, urls);
+    }
+}
+
+fn collectUrlsFromEntities(allocator: std.mem.Allocator, entities: std.json.Value, urls: *std.StringHashMap(void)) !void {
+    const arr = getArray(entities, "urls") orelse return;
+    for (arr.items) |item| {
+        if (item != .object) continue;
+        const url = getString(item, "unwound_url") orelse getString(item, "expanded_url") orelse getString(item, "url") orelse continue;
+        if (url.len == 0 or urls.contains(url)) continue;
+        try urls.put(try allocator.dupe(u8, url), {});
+    }
+}
+
+fn writeRawWhyThisMayMatter(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, author_id: []const u8, root: ?std.json.Value, urls: *std.StringHashMap(void)) !void {
+    try writer.writeAll("## Why This May Matter\n\n");
+    var wrote = false;
+    if (urls.count() > 0) {
+        try writer.writeAll("- Has external link(s).\n");
+        wrote = true;
+    }
+    if (rawTweetHasQuote(root)) {
+        try writer.writeAll("- Quote-post present.\n");
+        wrote = true;
+    }
+    if (try tweetHasMedia(db, tweet_id)) {
+        try writer.writeAll("- Media present.\n");
+        wrote = true;
+    }
+    if (try tweetHasFolders(db, tweet_id)) {
+        try writer.writeAll("- Foldered bookmark.\n");
+        wrote = true;
+    }
+    const author_count = try authorBookmarkCount(db, allocator, author_id);
+    if (author_count > 1) {
+        try writer.print("- Repeated author in bookmark corpus: {} active bookmarks.\n", .{author_count});
+        wrote = true;
+    }
+    if (!wrote) try writer.writeAll("- No deterministic hints beyond being bookmarked.\n");
+    try writer.writeAll("\n");
+}
+
+fn rawTweetHasQuote(root: ?std.json.Value) bool {
+    const value = root orelse return false;
+    const refs = getArray(value, "referenced_tweets") orelse return false;
+    for (refs.items) |ref| {
+        if (ref == .object and std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) return true;
+    }
+    return false;
+}
+
+fn tweetHasMedia(db: *Db, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM tweet_media WHERE tweet_id=? LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn tweetHasFolders(db: *Db, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM bookmark_folder_items WHERE tweet_id=? LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn authorBookmarkCount(db: *Db, allocator: std.mem.Allocator, author_id: []const u8) !i64 {
+    _ = allocator;
+    if (author_id.len == 0) return 0;
+    const stmt = try db.prepare(
+        \\SELECT count(*)
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\WHERE b.active = 1 AND t.author_id = ?
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, author_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return AppError.SqliteError;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn writeRawLinksSection(writer: anytype, canonical_uri: []const u8, twitter_uri: []const u8, urls: *std.StringHashMap(void)) !void {
+    try writer.writeAll("## Links\n\n");
+    try writer.print("- X: {s}\n", .{canonical_uri});
+    try writer.print("- Twitter: {s}\n", .{twitter_uri});
+    var it = urls.keyIterator();
+    while (it.next()) |url| try writer.print("- Extracted URL: {s}\n", .{url.*});
+    try writer.writeAll("\n");
+}
+
+fn writeRawQuotePostSection(db: *Db, allocator: std.mem.Allocator, writer: anytype, root: ?std.json.Value) !void {
+    if (!rawTweetHasQuote(root)) return;
+    try writer.writeAll("## Quote Post\n\n");
+    const value = root.?;
+    const refs = getArray(value, "referenced_tweets") orelse return;
+    for (refs.items) |ref| {
+        if (ref != .object or !std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+        const quote_id = getString(ref, "id") orelse continue;
+        const stmt = try db.prepare(
+            \\SELECT coalesce(t.text, ''), coalesce(t.canonical_uri, ''), coalesce(u.username, '')
+            \\FROM tweets t
+            \\LEFT JOIN users u ON u.user_id = t.author_id
+            \\WHERE t.tweet_id = ?
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, quote_id);
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try writer.print("- Quoted @{s}: ", .{if (colText(stmt, 2).len > 0) colText(stmt, 2) else "unknown"});
+            try writeMarkdownEscaped(writer, colText(stmt, 0));
+            try writer.print("\n- URL: {s}\n\n", .{colText(stmt, 1)});
+        } else {
+            const uri = try canonicalUri(allocator, null, quote_id);
+            defer allocator.free(uri);
+            try writer.print("- Quoted post not locally available: {s}\n\n", .{uri});
+        }
+    }
+}
+
+fn writeRawMediaSection(db: *Db, writer: anytype, tweet_id: []const u8) !void {
+    const stmt = try db.prepare(
+        \\SELECT tm.media_key, coalesce(m.type, ''), coalesce(m.url, ''), coalesce(m.preview_image_url, ''),
+        \\       coalesce(ma.asset_kind, ''), coalesce(ma.status, ''), coalesce(ma.local_path, '')
+        \\FROM tweet_media tm
+        \\LEFT JOIN media m ON m.media_key = tm.media_key
+        \\LEFT JOIN media_assets ma ON ma.media_key = tm.media_key
+        \\WHERE tm.tweet_id = ?
+        \\ORDER BY tm.position, ma.id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var wrote_heading = false;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (!wrote_heading) {
+            try writer.writeAll("## Media\n\n");
+            wrote_heading = true;
+        }
+        try writer.print("- {s} ({s})", .{ colText(stmt, 0), if (colText(stmt, 1).len > 0) colText(stmt, 1) else "unknown" });
+        if (colText(stmt, 6).len > 0) {
+            try writer.print(": `{s}` ({s}, {s})", .{ colText(stmt, 6), colText(stmt, 4), colText(stmt, 5) });
+        } else if (colText(stmt, 2).len > 0) {
+            try writer.print(": {s}", .{colText(stmt, 2)});
+        } else if (colText(stmt, 3).len > 0) {
+            try writer.print(": {s}", .{colText(stmt, 3)});
+        }
+        try writer.writeAll("\n");
+    }
+    if (wrote_heading) try writer.writeAll("\n");
+}
+
 fn obsidianStatus(db: *Db, allocator: std.mem.Allocator, cfg: Config, vault_override: ?[]const u8) !void {
     var paths = try resolveObsidianPaths(allocator, cfg, vault_override);
     defer paths.deinit(allocator);
@@ -6611,6 +7211,121 @@ test "full obsidian export is explicit and writes notes assets and diagnostic in
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "failed-assets.md" })));
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "data", "bookmarks-index.json" })));
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "data", "media-assets-index.json" })));
+}
+
+test "kb init and raw X export create agent-ingestable raw inbox" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try absolutize(allocator, base_rel);
+    const db_path = try std.fs.path.join(allocator, &.{ base, "kb.sqlite" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var quote_user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"2\",\"username\":\"bob\",\"name\":\"Bob\"}", .{});
+    defer quote_user.deinit();
+    try upsertUserFromValue(&db, allocator, quote_user.value);
+    var media = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"media_key":"3_kb","type":"photo","url":"https://example.invalid/photo.jpg","alt_text":"fixture photo"}
+    , .{});
+    defer media.deinit();
+    try upsertMediaFromValue(&db, allocator, media.value);
+    var quote = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"901","author_id":"2","text":"Quoted idea","created_at":"2026-05-10T10:00:00.000Z"}
+    , .{});
+    defer quote.deinit();
+    try upsertTweetFromValue(&db, allocator, quote.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"900","author_id":"1","text":"Short text https://t.co/a","created_at":"2026-05-11T12:00:00.000Z","attachments":{"media_keys":["3_kb"]},"referenced_tweets":[{"type":"quoted","id":"901"}],"entities":{"urls":[{"url":"https://t.co/a","expanded_url":"https://example.invalid/article"}]},"note_tweet":{"text":"Expanded long text","entities":{"urls":[{"url":"https://t.co/b","expanded_url":"https://example.invalid/deeper"}]}}}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "900", run_id, 0, true);
+    var folder = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"folder-1\",\"name\":\"Reading\"}", .{});
+    defer folder.deinit();
+    try upsertFolderFromValue(&db, allocator, "acct", folder.value);
+    try upsertFolderItem(&db, allocator, "acct", "folder-1", "900");
+    try recordMediaAsset(&db, allocator, "3_kb", "image", "https://example.invalid/photo.jpg", "/tmp/photo.jpg", "image/jpeg", 12, null, null, null, "downloaded", null);
+
+    const config_paths = try resolvePaths(allocator, null, base);
+    var cfg = try Config.default(allocator, config_paths, base);
+    const vault = try std.fs.path.join(allocator, &.{ base, "Vault" });
+    cfg.obsidian_vault_path = vault;
+    var paths = try resolveObsidianPaths(allocator, cfg, null);
+    defer paths.deinit(allocator);
+
+    try kbInit(allocator, paths);
+    var stats = try kbExportRawX(&db, allocator, paths, true);
+    try std.testing.expectEqual(@as(u32, 1), stats.total);
+    try std.testing.expectEqual(@as(u32, 1), stats.written);
+    try std.testing.expectEqual(@as(u32, 0), stats.skipped_unchanged);
+
+    const raw_path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", "900.md" });
+    const raw = try std.fs.cwd().readFileAlloc(allocator, raw_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "source_type: \"x_bookmark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "status: \"inbox\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Expanded long text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "- Has external link(s).") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "- Quote-post present.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "- Foldered bookmark.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "- Extracted URL: https://example.invalid/article") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "- Quoted @bob: Quoted idea") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "`/tmp/photo.jpg`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "## Raw Metadata") != null);
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ paths.root, "wiki", "schema.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ paths.root, "wiki", "index.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ paths.root, "wiki", "log.md" })));
+
+    stats = try kbExportRawX(&db, allocator, paths, true);
+    try std.testing.expectEqual(@as(u32, 0), stats.written);
+    try std.testing.expectEqual(@as(u32, 1), stats.skipped_unchanged);
+}
+
+test "kb raw X export does not move processed sources back to inbox" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try absolutize(allocator, base_rel);
+    const db_path = try std.fs.path.join(allocator, &.{ base, "kb-processed.sqlite" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"950\",\"text\":\"already processed\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "950", run_id, 0, true);
+
+    const config_paths = try resolvePaths(allocator, null, base);
+    var cfg = try Config.default(allocator, config_paths, base);
+    const vault = try std.fs.path.join(allocator, &.{ base, "Vault" });
+    cfg.obsidian_vault_path = vault;
+    var paths = try resolveObsidianPaths(allocator, cfg, null);
+    defer paths.deinit(allocator);
+    try kbInit(allocator, paths);
+    const ingested_path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ingested", "950.md" });
+    try ensureParentDir(ingested_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = ingested_path, .data = "processed" });
+
+    const stats = try kbExportRawX(&db, allocator, paths, true);
+    try std.testing.expectEqual(@as(u32, 1), stats.total);
+    try std.testing.expectEqual(@as(u32, 0), stats.written);
+    try std.testing.expectEqual(@as(u32, 1), stats.skipped_processed);
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", "950.md" })));
 }
 
 test "missing quoted post references preserve protected error status" {

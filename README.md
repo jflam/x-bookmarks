@@ -74,6 +74,9 @@ x-bookmarks obsidian export --dry-run
 x-bookmarks obsidian export
 x-bookmarks obsidian export --mode full
 x-bookmarks obsidian migrate-media --dry-run
+x-bookmarks kb init
+x-bookmarks kb export-raw-x --changed
+x-bookmarks kb status
 x-bookmarks bookmarks stats
 x-bookmarks bookmarks list --limit 50
 x-bookmarks integration test --live --limit-pages 1
@@ -124,6 +127,7 @@ Implemented:
 - quote-post ingestion, missing quote-reference records, full `note_tweet` text rendering, deterministic X/Twitter post URIs, and JSONL export
 - static viewer export with local JSON manifests, copied media assets, folder filters, quote posts, media galleries, playable MP4 video previews, and byte-range streaming in `viewer serve`
 - Obsidian export under a tool-owned vault subtree, defaulting to generated year/month timeline notes with one X embed per bookmark; full Markdown notes, image asset materialization, and diagnostic sidecars are opt-in with `--mode full`
+- knowledge-base bootstrap under the configured Obsidian root with `raw/x/inbox`, starter `wiki/schema.md`, `wiki/index.md`, `wiki/log.md`, and changed-only raw X bookmark Markdown export for agent ingestion
 - bookmark stats/list inspection and a gated live integration-test command
 
 Known limitations:
