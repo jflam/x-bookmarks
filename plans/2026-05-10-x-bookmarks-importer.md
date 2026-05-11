@@ -8,6 +8,17 @@ Build a deterministic agent-runnable tool that incrementally reads the authentic
 
 The importer must retrieve enough data for later full offline rendering of each bookmarked post. That includes the bookmarked post JSON, author metadata, referenced quote-post metadata, media metadata, and downloaded media assets such as images, preview images, animated GIF/video variants, and author avatars where available.
 
+The importer must also preserve canonical X/Twitter URIs for every stored post. Human-facing tools such as Obsidian can use the original URIs for interactive rendering, while batch agents should use the downloaded text, metadata, and local media assets so analysis does not require network access.
+
+## Product Decisions
+
+- First version includes X bookmark folder/bucket metadata.
+- OAuth token state lives in the user profile data directory at `~/.local/share/x-bookmarks/oauth-token.json`.
+- Use the same XDG-style paths on macOS and Linux; do not add macOS-specific defaults.
+- Incremental sync stops once it reaches a bookmark that has already been fully downloaded locally. `--full` remains available to force a complete scan.
+- Media downloads are part of the first version, including images, previews, selected video/GIF variants, and author avatars when available.
+- A visual validation surface is required: after ingestion, the user should be able to browse the downloaded bookmarks in a local web UI that approximates the original X/Twitter post layout.
+
 ## Confirmed API Research
 
 Official X API docs confirm:
@@ -48,7 +59,7 @@ Primary docs:
 
 ## Resolved Research Conclusions
 
-- Bookmark ordering is not documented in the current `GET /2/users/{id}/bookmarks` API reference. The importer must not depend on reverse chronological ordering for correctness. The default sync must scan until no `meta.next_token` is returned. Early-stop optimization can only be enabled explicitly after local empirical validation.
+- Bookmark ordering is not documented in the current `GET /2/users/{id}/bookmarks` API reference. Product decision: normal incremental mode should stop once it reaches an already fully downloaded bookmark to control cost and runtime. The implementation must keep `--full` for complete scans, record when early-stop was used, and warn if observed API ordering looks inconsistent across runs.
 - Current docs do not document a hard total-result cap for bookmark lookup. Older developer docs mention returning the 800 most recent bookmarks. Because this may still be an account/tier/API behavior, the implementation must record total pages/results per run and warn if the API appears capped. The tool can only guarantee "all bookmarks exposed by the X API."
 - API access requires an approved developer account, a Project, an App, OAuth 2.0 user-context credentials, and purchased/available X API pay-per-use credits if required by the developer account. The user should verify access in the Developer Console before running a full import.
 - Bookmark folders/buckets are real API resources and should be supported as metadata. They are not required to discover the complete bookmark set because the main bookmarks endpoint returns all bookmarks exposed by the API, but folder membership should be synced when the folder endpoints are available.
@@ -172,6 +183,16 @@ Recommended SQLite compile flags:
 
 Keep the first build simple. Add more SQLite flags only after measuring binary size or discovering a concrete requirement.
 
+Viewer build:
+
+- The importer CLI remains zero-runtime-dependency Zig.
+- The visual validation app is a separate Bun + TypeScript + React app under `viewer/`.
+- Use Vite for the viewer dev server and static production build unless there is a concrete reason to avoid it.
+- Bun, TypeScript, React, and Vite dependencies are validation-tool dependencies only, not runtime dependencies of the importer CLI.
+- The React app should be buildable into static assets that the Zig CLI can either serve from disk or copy into an export directory.
+- The viewer must consume generated JSON manifests and local asset paths; it should not call the X API and should not require network access for normal bookmark rendering.
+- The viewer can use npm ecosystem packages through Bun when useful, but keep the viewer dependency set small and conventional.
+
 Proposed package layout:
 
 ```text
@@ -193,6 +214,13 @@ Proposed package layout:
 │   ├── migrations.zig
 │   ├── sync.zig
 │   └── x_api.zig
+├── viewer/
+│   ├── package.json
+│   ├── bun.lock
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   ├── src/
+│   └── README.md
 ├── vendor/
 │   └── sqlite/
 │       ├── sqlite3.c
@@ -243,9 +271,10 @@ Default state paths without `--home`:
 ~/.local/share/x-bookmarks/oauth-token.json
 ~/.local/share/x-bookmarks/x_bookmarks.sqlite
 ~/.local/share/x-bookmarks/assets/
+~/.local/share/x-bookmarks/viewer-export/
 ```
 
-On macOS, prefer the same XDG-style paths above for this project unless a future requirement says otherwise. This keeps the CLI behavior consistent across developer machines, agents, and Unix-like pipeline environments.
+On macOS, use the same XDG-style paths above. Keep path behavior consistent across developer machines, agents, and Unix-like pipeline environments.
 
 Initial `~/.config/x-bookmarks/config.json` shape:
 
@@ -265,10 +294,13 @@ Initial `~/.config/x-bookmarks/config.json` shape:
   "sync": {
     "max_results": 100,
     "store_raw_pages": true,
-    "conservative_full_scan": true,
     "download_media": true,
     "quote_post_depth": 1,
-    "require_approval": true
+    "require_approval": true,
+    "stop_at_first_complete_bookmark": true
+  },
+  "viewer": {
+    "export_dir": "~/.local/share/x-bookmarks/viewer-export"
   }
 }
 ```
@@ -291,6 +323,8 @@ Config rules:
 - Missing parent directories should be created by commands that write local state.
 - `sync.require_approval` defaults to `true` for interactive use.
 - Agentic or scheduled invocations can pass `--yolo` to bypass confirmation prompts.
+- `sync.stop_at_first_complete_bookmark` defaults to `true` for normal incremental sync.
+- `--full` overrides `sync.stop_at_first_complete_bookmark` and scans until no `meta.next_token` is returned.
 
 OAuth token location:
 
@@ -399,6 +433,8 @@ Columns:
 - `pages_requested INTEGER NOT NULL DEFAULT 0`
 - `tweets_seen INTEGER NOT NULL DEFAULT 0`
 - `new_bookmarks INTEGER NOT NULL DEFAULT 0`
+- `early_stop_used INTEGER NOT NULL DEFAULT 0`
+- `early_stop_tweet_id TEXT`
 - `error_json TEXT`
 
 ### `tweets`
@@ -410,6 +446,8 @@ Columns:
 - `tweet_id TEXT PRIMARY KEY`
 - `author_id TEXT`
 - `conversation_id TEXT`
+- `canonical_uri TEXT NOT NULL`
+- `twitter_uri TEXT NOT NULL`
 - `created_at TEXT`
 - `text TEXT`
 - `lang TEXT`
@@ -417,6 +455,12 @@ Columns:
 - `raw_json TEXT NOT NULL`
 - `first_seen_at TEXT NOT NULL`
 - `last_seen_at TEXT NOT NULL`
+
+Notes:
+
+- `canonical_uri` should use `https://x.com/{username_or_i}/status/{tweet_id}` when the username is known, falling back to `https://x.com/i/web/status/{tweet_id}`.
+- `twitter_uri` should preserve the legacy-compatible form `https://twitter.com/i/web/status/{tweet_id}` for tools that still expect Twitter URLs.
+- Store any API-provided URL entities in `raw_json`; do not treat shortened `t.co` URLs as the canonical post URI.
 
 ### `users`
 
@@ -494,6 +538,7 @@ Columns:
 - `account_user_id TEXT NOT NULL`
 - `tweet_id TEXT NOT NULL`
 - `active INTEGER NOT NULL DEFAULT 1`
+- `complete_for_offline_render INTEGER NOT NULL DEFAULT 0`
 - `first_seen_run_id INTEGER NOT NULL`
 - `last_seen_run_id INTEGER NOT NULL`
 - `first_seen_at TEXT NOT NULL`
@@ -504,10 +549,12 @@ Notes:
 
 - `active` can eventually support detecting removals after full scans.
 - Do not use tweet ID as an incremental cursor. A user can newly bookmark an old tweet.
+- `complete_for_offline_render` is true only after the bookmarked post, author, direct quote-post data, folder sync state, and required media assets have been stored or explicitly marked unavailable/skipped.
+- Normal incremental sync can stop when it reaches a bookmark item where `complete_for_offline_render = 1`.
 
 ### `bookmark_folders`
 
-Named bookmark buckets/collections from the X UI, if available through the account's API tier.
+Named bookmark buckets/collections from the X UI.
 
 Columns:
 
@@ -521,7 +568,7 @@ Columns:
 
 ### `bookmark_folder_items`
 
-Folder membership for bookmarked tweets, if available.
+Folder membership for bookmarked tweets.
 
 Columns:
 
@@ -577,6 +624,7 @@ Media download policy:
 
 - Download media assets by default when ingesting newly discovered bookmarks.
 - Download image URLs and preview images where available.
+- Download author avatar images for bookmarked posts and direct quote posts where profile image URLs are available.
 - For videos and animated GIFs, choose one deterministic preferred variant by default, such as the highest bitrate MP4 variant under configured size limits.
 - Record skipped media with a reason, rather than silently ignoring it.
 - Add future config for maximum media bytes per asset and allowed media kinds if real usage shows the need.
@@ -589,7 +637,7 @@ Command:
 x-bookmarks sync
 ```
 
-Default conservative sync:
+Default incremental sync:
 
 1. Load account and token state.
 2. Refresh the access token if expired or close to expiry.
@@ -603,34 +651,40 @@ Default conservative sync:
    - Upsert tweets from `data`.
    - Upsert expanded users/media from `includes`.
    - Upsert direct quote-post data from `includes.tweets` to depth `1` when needed for rendering.
+   - Generate and store canonical X/Twitter post URIs for each stored post.
    - Insert unseen `(account_user_id, tweet_id)` records in `bookmark_items`.
    - Update `last_seen_*` fields for existing bookmarks.
    - Download media assets required for offline rendering.
-   - Follow `meta.next_token` until absent.
-9. If bookmark folders are available, sync folder metadata and folder membership.
+   - Mark `complete_for_offline_render = 1` only after all required local content is stored or explicitly marked unavailable/skipped.
+   - In normal incremental mode, stop when the run reaches the first bookmark already marked `complete_for_offline_render = 1`.
+   - In `--full` mode, follow `meta.next_token` until absent.
+9. Sync bookmark folder metadata and folder membership.
 10. Mark run `succeeded`.
 
 Failure behavior:
 
 - On rate limit, honor `x-rate-limit-reset` and either wait or exit with a distinct rate-limit code depending on CLI flags.
 - On auth failure, attempt token refresh once.
+- If folder endpoints fail because the API tier/account does not expose them, record structured folder-sync failure and leave bookmark ingestion usable; do not silently omit folders.
 - On persistent failure, mark run `failed` with structured error JSON.
 - Partial page writes should be committed page-by-page so reruns can proceed safely.
 
 ## Incremental Strategy
 
-Phase 1:
+Default incremental mode:
 
-- Always scan all pages.
-- Only insert bookmarks and tweets that are not already present.
-- Only download media assets that are not already present and valid by local path/hash.
-- This is simplest and safest because it does not depend on undocumented ordering.
+- Request bookmark pages from the start using fixed query params.
+- Insert only bookmarks and tweets that are not already present.
+- Download only media assets that are not already present and valid by local path/hash.
+- Stop when the run reaches the first bookmark already marked `complete_for_offline_render = 1`.
+- Record in `sync_runs` that early-stop was used and which tweet ID caused the stop.
+- If observed ordering looks inconsistent across runs, warn and recommend `x-bookmarks sync --full`.
 
-Phase 2 optimization:
+Full mode:
 
-- Add `--stop-after-existing-pages N`.
-- If bookmark ordering is verified as newest-bookmark-first, stop after `N` consecutive pages with no new bookmark IDs.
-- Keep full scan available via `--full`.
+- `x-bookmarks sync --full` scans all pages until no `meta.next_token` is returned.
+- Full mode should update `last_seen_*`, folder membership, missing assets, and removal/active-state signals.
+- Use full mode periodically as a validation/audit pass.
 
 ## CLI Plan
 
@@ -648,6 +702,8 @@ x-bookmarks sync --yolo
 x-bookmarks sync --full
 x-bookmarks sync --limit-pages N
 x-bookmarks export --format jsonl
+x-bookmarks viewer export
+x-bookmarks viewer serve
 ```
 
 Useful later commands:
@@ -666,6 +722,104 @@ Approval behavior:
 - `x-bookmarks sync --yolo` bypasses all confirmation prompts and is the intended flag for agentic/scheduled invocation.
 - `--yolo` should still fail fast on missing config, missing auth, API errors, or database migration failures.
 
+## Visual Validation Plan
+
+After running the importer, the user needs a clear way to visually inspect the downloaded bookmarks. This is a first-class validation requirement, not a nice-to-have.
+
+Create a separate Bun + TypeScript + React web app under `viewer/` that renders imported bookmarks from local exported data. Use Vite for development and static builds. The target is to approximate the original X/Twitter post layout closely enough to validate that text, authors, timestamps, quote posts, media, and folder metadata were ingested correctly.
+
+Viewer constraints:
+
+- The viewer is separate from the zero-runtime-dependency Zig CLI.
+- The viewer uses Bun for package management and scripts.
+- The viewer uses TypeScript, React, and Vite.
+- Viewer dependencies are allowed because this is validation tooling, not the core importer runtime.
+- The built viewer should be static HTML/CSS/JS that reads generated local JSON and asset files.
+- Normal viewer rendering must not call the X API.
+- Normal viewer rendering must not require internet access.
+- Original post URIs should be shown as links so a human can open X interactively when desired.
+- Local downloaded text and media must be the source of truth for offline review and agent/batch analysis.
+
+Viewer export command:
+
+Viewer development commands:
+
+```bash
+cd viewer
+bun install
+bun run dev
+bun run build
+```
+
+Importer-generated export command:
+
+```bash
+x-bookmarks viewer export
+```
+
+This command should generate a static export directory, defaulting to:
+
+```text
+~/.local/share/x-bookmarks/viewer-export/
+```
+
+Export contents:
+
+```text
+viewer-export/
+├── index.html
+├── assets/
+│   └── ...
+├── data/
+│   ├── bookmarks.json
+│   ├── folders.json
+│   ├── media-assets.json
+│   └── sync-summary.json
+└── static/
+    └── ...
+```
+
+Viewer serve command:
+
+```bash
+x-bookmarks viewer serve
+```
+
+This command should serve the generated viewer export from localhost using the Zig CLI, for example:
+
+```text
+http://127.0.0.1:8766
+```
+
+Viewer screens:
+
+- All bookmarks, newest-first according to the API/import order.
+- Folder filter using synced X bookmark folders/buckets.
+- Missing/failed assets filter.
+- Offline completeness filter.
+- Per-bookmark detail view showing:
+  - author display name, username, avatar
+  - post text and expanded display entities where available
+  - canonical X URI and legacy Twitter URI
+  - created timestamp
+  - media gallery from local assets
+  - direct quote post rendered inline to depth `1`
+  - folder memberships
+  - raw JSON toggle for debugging
+
+Offline validation checks:
+
+- `x-bookmarks viewer export` should fail or warn if any bookmark marked `complete_for_offline_render = 1` references a missing local asset.
+- `x-bookmarks assets verify` should verify local asset paths, byte sizes, and hashes.
+- `sync-summary.json` should include counts for total bookmarks, new bookmarks, complete bookmarks, incomplete bookmarks, failed media assets, skipped media assets, folders, and quote posts.
+- A human should be able to scan the viewer and answer: "Do these downloaded bookmarks look like the posts I saved?"
+
+Obsidian and knowledge-base integration:
+
+- Exports must preserve original X/Twitter post URIs because other agents/tools may use those URIs to render rich embeds in Obsidian for interactive human workflows.
+- JSONL exports must include both original URIs and local offline content paths so batch agents can analyze tweets and images without network access.
+- Do not rely on Obsidian or online embeds for machine analysis; downloaded text, raw JSON, and media assets are the analysis substrate.
+
 ## Determinism Requirements
 
 - The binary should run without external runtime dependencies.
@@ -683,6 +837,8 @@ Approval behavior:
 - Raw API responses can be preserved for auditability.
 - Quote-post hydration depth is fixed at `1` by default to avoid unpredictable API and media download expansion.
 - Interactive approval is the default before new bookmark/media downloads; `--yolo` is the deterministic non-interactive bypass.
+- Each exported bookmark must include stable post URIs plus local asset references.
+- Viewer export output should be deterministic for a fixed database state, except generated timestamp metadata in `sync-summary.json`.
 
 ## Testing Plan
 
@@ -698,7 +854,10 @@ Unit tests:
 - Direct quote-post hydration with no recursive expansion.
 - Media asset planning and idempotent downloads.
 - Approval prompt behavior and `--yolo` bypass.
+- URI generation for canonical X and legacy Twitter post links.
+- `complete_for_offline_render` state transitions and early-stop behavior.
 - Incremental detection of new versus existing bookmarks.
+- Viewer export manifest generation.
 
 Fixture tests:
 
@@ -708,6 +867,8 @@ Fixture tests:
 - Test partial errors with `errors` plus `data`.
 - Test bookmarked post with quote post and media.
 - Test skipped or failed media download recording.
+- Test bookmark folder metadata and membership.
+- Test viewer export for complete, incomplete, and failed-asset bookmarks.
 
 Integration tests:
 
@@ -716,7 +877,9 @@ Integration tests:
 - Validate one-page bookmark fetch.
 - Validate one quote-post fetch if present.
 - Validate one media download if present.
+- Validate folder listing and one folder membership sync if folders are present.
 - Validate DB write path against a temporary SQLite file.
+- Validate generated viewer export can be served locally.
 
 ## Milestones
 
@@ -745,8 +908,10 @@ Integration tests:
 ### Milestone 4: Bookmark Sync
 
 - Implement X API client.
-- Implement conservative full pagination sync.
-- Upsert tweets, users, media, and bookmark items.
+- Implement incremental sync with stop-at-first-complete behavior.
+- Keep `--full` complete pagination sync.
+- Upsert tweets, users, media, bookmark items, folders, and folder membership.
+- Preserve canonical X and legacy Twitter URIs for posts.
 - Hydrate direct quote posts to depth `1`.
 - Add approval prompt and `--yolo` bypass.
 - Store raw pages.
@@ -762,19 +927,28 @@ Integration tests:
 
 - Implement JSONL export.
 - Define stable export shape for downstream interest graph generation.
-- Include local asset paths and quote-post data required for offline rendering.
+- Include canonical/legacy post URIs, local asset paths, folder metadata, and quote-post data required for offline rendering.
 
-### Milestone 7: Hardening
+### Milestone 7: Visual Validation
+
+- Create `viewer/` Bun + TypeScript + React/Vite app for local bookmark review.
+- Add viewer scripts for `bun run dev` and `bun run build`.
+- Implement `x-bookmarks viewer export`.
+- Implement `x-bookmarks viewer serve`.
+- Render bookmark list, folder filters, quote posts, media galleries, and missing-asset states.
+- Use the viewer as the manual validation surface after real imports.
+
+### Milestone 8: Hardening
 
 - Add rate-limit handling.
 - Add structured exit codes.
 - Add integration test mode.
-- Validate real API behavior around bookmark ordering and decide whether optimized incremental stopping is safe.
+- Validate real API behavior around bookmark ordering and warn if stop-at-first-complete appears unsafe.
 
-## Review Questions
+## Settled Review Answers
 
-1. Should the first version include X bookmark folder/bucket metadata, or should folder membership be deferred until basic bookmark and media ingestion works?
-2. Is `~/.config/x-bookmarks/config.json` plus `~/.local/share/x-bookmarks/oauth-token.json` the right split, or should OAuth token state live in SQLite despite being secret-bearing?
-3. Should we use these XDG-style paths on macOS too, or switch macOS defaults to `~/Library/Application Support/x-bookmarks/` later?
-4. Should the conservative default always scan all bookmark pages, or should we prioritize newest-first early stopping once verified?
-5. Should media downloads include video/GIF assets immediately, or should the first version handle still images and previews first?
+1. First version includes X bookmark folder/bucket metadata.
+2. OAuth token state lives in the user profile data directory, not SQLite.
+3. Use consistent XDG-style paths everywhere, including macOS.
+4. Normal incremental sync stops once it sees a bookmark already fully downloaded locally; `--full` forces a complete scan.
+5. First version downloads media, including images, previews, selected video/GIF variants, and author avatars where available.
