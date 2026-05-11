@@ -181,6 +181,71 @@ Use this flow to validate that a new bookmark is picked up incrementally:
    http://127.0.0.1:8766/
    ```
 
+## Export to Obsidian
+
+Initialize a tool-owned subtree inside an Obsidian vault:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian init --vault /absolute/path/to/ObsidianVault
+```
+
+This creates the generated timeline/index/data directories under `X Bookmarks/` and records the vault path in config. SQLite plus `storage.assets_dir` remain the source of truth; the Obsidian vault is a generated viewing layer.
+
+Preview the export without changing the vault:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian export --dry-run
+```
+
+Generate or update the default timeline export:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian export
+```
+
+The default export writes:
+
+```text
+X Bookmarks/timeline/<year>/<year-month>.md
+X Bookmarks/indexes/timeline.md
+X Bookmarks/data/export-summary.json
+```
+
+Monthly timeline notes group bookmarks by tweet creation month and contain one `![](https://x.com/...)` embed line per bookmark, so Obsidian embed plugins can render the tweets directly.
+
+Generate the larger Markdown note and local image export explicitly:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian export --mode full
+```
+
+Full mode adds `bookmarks/<tweet_id>.md`, `assets/`, diagnostic indexes, and JSON sidecars. Re-export replaces each generated note block while preserving text below the `## Notes` area.
+
+Check export status:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian status
+```
+
+Retry transient image/avatar/preview failures independently from export:
+
+```sh
+./zig-out/bin/x-bookmarks --home data assets retry --dry-run
+./zig-out/bin/x-bookmarks --home data assets retry --only-transient --max-attempts 1
+```
+
+After validating a copied data directory first, inspect local video/GIF files that can be removed under the images-only policy:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian migrate-media --dry-run
+```
+
+Apply cleanup only after the dry-run output is expected:
+
+```sh
+./zig-out/bin/x-bookmarks --home data obsidian migrate-media --remove-local-videos
+```
+
 ## Validate a Limited Page Fetch
 
 Use `--limit-pages` only when you want a bounded test:

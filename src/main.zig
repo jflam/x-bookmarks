@@ -48,6 +48,15 @@ const config_template =
     \\  },
     \\  "viewer": {
     \\    "export_dir": "~/.local/share/x-bookmarks/viewer-export"
+    \\  },
+    \\  "obsidian": {
+    \\    "vault_path": null,
+    \\    "root_dir": "X Bookmarks",
+    \\    "export_mode": "timeline-only",
+    \\    "timeline_dir": "timeline",
+    \\    "index_dir": "indexes",
+    \\    "data_dir": "data",
+    \\    "media_policy": "images-only"
     \\  }
     \\}
     \\
@@ -91,6 +100,32 @@ const Paths = struct {
     state_dir: []const u8,
 };
 
+const ObsidianExportMode = enum {
+    timeline_only,
+    full,
+
+    fn parse(value: []const u8) !ObsidianExportMode {
+        if (std.mem.eql(u8, value, "timeline-only")) return .timeline_only;
+        if (std.mem.eql(u8, value, "full")) return .full;
+        try std.fs.File.stderr().deprecatedWriter().writeAll("obsidian export mode must be timeline-only or full\n");
+        return AppError.InvalidArguments;
+    }
+
+    fn configParse(value: []const u8) !ObsidianExportMode {
+        if (std.mem.eql(u8, value, "timeline-only")) return .timeline_only;
+        if (std.mem.eql(u8, value, "full")) return .full;
+        try std.fs.File.stderr().deprecatedWriter().writeAll("config error: obsidian.export_mode must be timeline-only or full\n");
+        return AppError.ConfigInvalid;
+    }
+
+    fn label(self: ObsidianExportMode) []const u8 {
+        return switch (self) {
+            .timeline_only => "timeline-only",
+            .full => "full",
+        };
+    }
+};
+
 const Config = struct {
     client_id: []const u8,
     client_secret: ?[]const u8,
@@ -100,6 +135,16 @@ const Config = struct {
     token_path: []const u8,
     assets_dir: []const u8,
     export_dir: []const u8,
+    obsidian_vault_path: ?[]const u8,
+    obsidian_root_dir: []const u8,
+    obsidian_export_mode: ObsidianExportMode,
+    obsidian_timeline_dir: []const u8,
+    obsidian_note_dir: []const u8,
+    obsidian_asset_dir: []const u8,
+    obsidian_index_dir: []const u8,
+    obsidian_data_dir: []const u8,
+    obsidian_preserve_user_notes: bool,
+    media_policy: []const u8,
     max_results: u32,
     store_raw_pages: bool,
     download_media: bool,
@@ -121,6 +166,16 @@ const Config = struct {
             .token_path = try std.fs.path.join(allocator, &.{ state_dir, "oauth-token.json" }),
             .assets_dir = try std.fs.path.join(allocator, &.{ state_dir, "assets" }),
             .export_dir = try std.fs.path.join(allocator, &.{ state_dir, "viewer-export" }),
+            .obsidian_vault_path = null,
+            .obsidian_root_dir = try allocator.dupe(u8, "X Bookmarks"),
+            .obsidian_export_mode = .timeline_only,
+            .obsidian_timeline_dir = try allocator.dupe(u8, "timeline"),
+            .obsidian_note_dir = try allocator.dupe(u8, "bookmarks"),
+            .obsidian_asset_dir = try allocator.dupe(u8, "assets"),
+            .obsidian_index_dir = try allocator.dupe(u8, "indexes"),
+            .obsidian_data_dir = try allocator.dupe(u8, "data"),
+            .obsidian_preserve_user_notes = true,
+            .media_policy = try allocator.dupe(u8, "images-only"),
             .max_results = 100,
             .store_raw_pages = true,
             .download_media = true,
@@ -217,6 +272,8 @@ fn run() !void {
         try commandViewer(&rt);
     } else if (std.mem.eql(u8, cmd, "assets")) {
         try commandAssets(&rt);
+    } else if (std.mem.eql(u8, cmd, "obsidian")) {
+        try commandObsidian(&rt);
     } else if (std.mem.eql(u8, cmd, "integration")) {
         try commandIntegration(&rt);
     } else if (std.mem.eql(u8, cmd, "bookmarks")) {
@@ -275,6 +332,11 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] export --format jsonl
         \\  x-bookmarks [--config PATH] [--home PATH] viewer export|serve
         \\  x-bookmarks [--config PATH] [--home PATH] assets verify
+        \\  x-bookmarks [--config PATH] [--home PATH] assets retry [--only-transient] [--kind KIND] [--max-attempts N] [--dry-run]
+        \\  x-bookmarks [--config PATH] [--home PATH] obsidian init --vault PATH [--root-dir NAME]
+        \\  x-bookmarks [--config PATH] [--home PATH] obsidian status
+        \\  x-bookmarks [--config PATH] [--home PATH] obsidian export [--mode timeline-only|full] [--changed] [--dry-run] [--clean-stale] [--vault PATH]
+        \\  x-bookmarks [--config PATH] [--home PATH] obsidian migrate-media [--dry-run|--remove-local-videos]
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks list [--limit N]
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks stats
         \\  x-bookmarks [--config PATH] [--home PATH] integration test --live [--limit-pages N] [--max-results N] [--no-media]
@@ -861,14 +923,188 @@ fn commandViewer(rt: *Runtime) !void {
     }
 }
 
-fn commandAssets(rt: *Runtime) !void {
-    const sub = try requiredSubcommand(rt, "assets");
-    if (!std.mem.eql(u8, sub, "verify")) return AppError.InvalidCommand;
+fn commandObsidian(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "obsidian");
+    if (std.mem.eql(u8, sub, "init")) {
+        try obsidianInitCommand(rt);
+        return;
+    }
+
     const cfg = try loadRuntimeConfig(rt);
     var db = try Db.open(cfg.database_path, rt.allocator);
     defer db.close();
     try applyMigrations(&db);
-    try assetsVerify(&db, rt.allocator);
+
+    if (std.mem.eql(u8, sub, "status")) {
+        try obsidianStatus(&db, rt.allocator, cfg, null);
+    } else if (std.mem.eql(u8, sub, "export")) {
+        var opts = ObsidianExportOptions{};
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            const arg = rt.args[i];
+            if (std.mem.eql(u8, arg, "--changed")) {
+                opts.changed_only = true;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
+                opts.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--clean-stale")) {
+                opts.clean_stale = true;
+            } else if (std.mem.eql(u8, arg, "--mode")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.mode_override = try ObsidianExportMode.parse(rt.args[i]);
+            } else if (std.mem.eql(u8, arg, "--vault")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.vault_override = rt.args[i];
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        try obsidianExport(&db, rt.allocator, cfg, opts);
+    } else if (std.mem.eql(u8, sub, "migrate-media")) {
+        var dry_run = false;
+        var remove = false;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, rt.args[i], "--remove-local-videos")) {
+                remove = true;
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (dry_run == remove) return AppError.InvalidArguments;
+        try obsidianMigrateMedia(&db, rt.allocator, cfg, dry_run);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn obsidianInitCommand(rt: *Runtime) !void {
+    var vault: ?[]const u8 = null;
+    var root_dir: ?[]const u8 = null;
+    var i = rt.command_index + 2;
+    while (i < rt.args.len) : (i += 1) {
+        if (std.mem.eql(u8, rt.args[i], "--vault")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            vault = rt.args[i];
+        } else if (std.mem.eql(u8, rt.args[i], "--root-dir")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            root_dir = rt.args[i];
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+    const vault_path = vault orelse return AppError.InvalidArguments;
+    if (!std.fs.path.isAbsolute(vault_path)) {
+        try std.fs.File.stderr().deprecatedWriter().writeAll("obsidian init requires an absolute --vault path\n");
+        return AppError.ConfigInvalid;
+    }
+    if (root_dir) |r| if (!validManagedRelativePath(r)) return AppError.ConfigInvalid;
+
+    const paths = try resolvePaths(rt.allocator, rt.config_path_arg, rt.home_arg);
+    if (!fileExists(paths.config_path)) {
+        std.debug.print("missing config: {s}\nrun `x-bookmarks config init` first\n", .{paths.config_path});
+        return AppError.MissingConfig;
+    }
+    var cfg = try loadConfig(rt.allocator, paths, rt.home_arg);
+    cfg.obsidian_vault_path = try rt.allocator.dupe(u8, vault_path);
+    if (root_dir) |r| cfg.obsidian_root_dir = try rt.allocator.dupe(u8, r);
+    try validateConfig(cfg);
+
+    var resolved = try resolveObsidianPaths(rt.allocator, cfg, null);
+    defer resolved.deinit(rt.allocator);
+    try makeObsidianTimelineDirs(resolved);
+    const readme_path = try std.fs.path.join(rt.allocator, &.{ resolved.root, "README.md" });
+    defer rt.allocator.free(readme_path);
+    if (!fileExists(readme_path)) {
+        try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "# X Bookmarks\n\nThis directory is managed by x-bookmarks. The default export writes generated timeline notes for viewing bookmarked X posts in Obsidian.\n" });
+    }
+    try writeObsidianConfig(rt.allocator, paths.config_path, vault_path, cfg.obsidian_root_dir);
+    try std.fs.File.stdout().deprecatedWriter().print("initialized Obsidian export root: {s}\n", .{resolved.root});
+}
+
+fn commandAssets(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "assets");
+    const cfg = try loadRuntimeConfig(rt);
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    if (std.mem.eql(u8, sub, "verify")) {
+        try assetsVerify(&db, rt.allocator);
+    } else if (std.mem.eql(u8, sub, "retry")) {
+        try assetsRetryCommand(&db, rt.allocator, cfg, rt);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+const AssetRetryOptions = struct {
+    only_transient: bool = false,
+    kind: ?[]const u8 = null,
+    max_attempts: u32 = 3,
+    dry_run: bool = false,
+};
+
+const ObsidianExportOptions = struct {
+    mode_override: ?ObsidianExportMode = null,
+    changed_only: bool = false,
+    dry_run: bool = false,
+    clean_stale: bool = false,
+    vault_override: ?[]const u8 = null,
+};
+
+const ObsidianPaths = struct {
+    vault: []const u8,
+    root: []const u8,
+    notes: []const u8,
+    assets: []const u8,
+    images: []const u8,
+    previews: []const u8,
+    avatars: []const u8,
+    indexes: []const u8,
+    timeline: []const u8,
+    data: []const u8,
+
+    fn deinit(self: ObsidianPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.vault);
+        allocator.free(self.root);
+        allocator.free(self.notes);
+        allocator.free(self.assets);
+        allocator.free(self.images);
+        allocator.free(self.previews);
+        allocator.free(self.avatars);
+        allocator.free(self.indexes);
+        allocator.free(self.timeline);
+        allocator.free(self.data);
+    }
+};
+
+fn assetsRetryCommand(db: *Db, allocator: std.mem.Allocator, cfg: Config, rt: *Runtime) !void {
+    var opts = AssetRetryOptions{};
+    var i = rt.command_index + 2;
+    while (i < rt.args.len) : (i += 1) {
+        const arg = rt.args[i];
+        if (std.mem.eql(u8, arg, "--only-transient")) {
+            opts.only_transient = true;
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            opts.kind = rt.args[i];
+        } else if (std.mem.eql(u8, arg, "--max-attempts")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            opts.max_attempts = try parseU32Arg(rt.args[i]);
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            opts.dry_run = true;
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+    try assetsRetry(db, allocator, cfg, opts);
 }
 
 fn commandIntegration(rt: *Runtime) !void {
@@ -1152,6 +1388,18 @@ fn loadConfig(allocator: std.mem.Allocator, paths: Paths, home_override: ?[]cons
     if (getObject(root, "viewer")) |viewer| {
         if (getString(viewer, "export_dir")) |v| cfg.export_dir = try resolveConfiguredPath(allocator, cfg, v);
     }
+    if (getObject(root, "obsidian")) |obsidian| {
+        if (getNullableString(obsidian, "vault_path")) |v| cfg.obsidian_vault_path = if (v) |s| try resolveConfiguredPath(allocator, cfg, s) else null;
+        if (getString(obsidian, "root_dir")) |v| cfg.obsidian_root_dir = try allocator.dupe(u8, v);
+        if (getString(obsidian, "export_mode")) |v| cfg.obsidian_export_mode = try ObsidianExportMode.configParse(v);
+        if (getString(obsidian, "timeline_dir")) |v| cfg.obsidian_timeline_dir = try allocator.dupe(u8, v);
+        if (getString(obsidian, "note_dir")) |v| cfg.obsidian_note_dir = try allocator.dupe(u8, v);
+        if (getString(obsidian, "asset_dir")) |v| cfg.obsidian_asset_dir = try allocator.dupe(u8, v);
+        if (getString(obsidian, "index_dir")) |v| cfg.obsidian_index_dir = try allocator.dupe(u8, v);
+        if (getString(obsidian, "data_dir")) |v| cfg.obsidian_data_dir = try allocator.dupe(u8, v);
+        if (getBool(obsidian, "preserve_user_notes")) |v| cfg.obsidian_preserve_user_notes = v;
+        if (getString(obsidian, "media_policy")) |v| cfg.media_policy = try allocator.dupe(u8, v);
+    }
     if (getObject(root, "sync")) |sync| {
         if (getInt(sync, "max_results")) |v| cfg.max_results = try parseConfigU32(v);
         if (getBool(sync, "store_raw_pages")) |v| cfg.store_raw_pages = v;
@@ -1232,6 +1480,11 @@ fn printConfigStatus(allocator: std.mem.Allocator, cfg: Config) !void {
         \\token path: {s}
         \\assets dir: {s}
         \\viewer export dir: {s}
+        \\obsidian vault: {s}
+        \\obsidian root dir: {s}
+        \\obsidian export mode: {s}
+        \\obsidian timeline dir: {s}
+        \\media policy: {s}
         \\redirect uri: {s}
         \\scopes: {s}
         \\client id: {s}
@@ -1247,6 +1500,11 @@ fn printConfigStatus(allocator: std.mem.Allocator, cfg: Config) !void {
         cfg.token_path,
         cfg.assets_dir,
         cfg.export_dir,
+        cfg.obsidian_vault_path orelse "not configured",
+        cfg.obsidian_root_dir,
+        cfg.obsidian_export_mode.label(),
+        cfg.obsidian_timeline_dir,
+        cfg.media_policy,
         cfg.redirect_uri,
         scopes,
         if (cfg.client_id.len > 0 and !std.mem.eql(u8, cfg.client_id, "your-client-id")) "configured" else "missing",
@@ -1284,7 +1542,29 @@ fn validateConfig(cfg: Config) !void {
         try configError("config error: storage and viewer paths must be non-empty\n");
         valid = false;
     }
+    if (!validMediaPolicy(cfg.media_policy)) {
+        try configError("config error: obsidian.media_policy must be images-only, all-local, or metadata-only\n");
+        valid = false;
+    }
+    if (!validManagedRelativePath(cfg.obsidian_root_dir) or !validManagedRelativePath(cfg.obsidian_timeline_dir) or !validManagedRelativePath(cfg.obsidian_note_dir) or !validManagedRelativePath(cfg.obsidian_asset_dir) or !validManagedRelativePath(cfg.obsidian_index_dir) or !validManagedRelativePath(cfg.obsidian_data_dir)) {
+        try configError("config error: obsidian managed directories must be relative paths without traversal\n");
+        valid = false;
+    }
     if (!valid) return AppError.ConfigInvalid;
+}
+
+fn validMediaPolicy(policy: []const u8) bool {
+    return std.mem.eql(u8, policy, "images-only") or std.mem.eql(u8, policy, "all-local") or std.mem.eql(u8, policy, "metadata-only");
+}
+
+fn validManagedRelativePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    var parts = std.mem.splitAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
 }
 
 fn configError(message: []const u8) !void {
@@ -1452,6 +1732,54 @@ fn applyMigrations(db: *Db) !void {
         \\CREATE INDEX IF NOT EXISTS idx_bookmark_items_last_seen ON bookmark_items(account_user_id, last_seen_run_id);
         \\CREATE INDEX IF NOT EXISTS idx_media_assets_status ON media_assets(status);
         \\INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES ('001_initial', datetime('now'));
+    );
+    try ensureMediaAssetPolicyColumns(db);
+    try backfillMediaAssetPolicyColumns(db);
+}
+
+fn ensureMediaAssetPolicyColumns(db: *Db) !void {
+    if (!try tableColumnExists(db, "media_assets", "retrieval_policy")) try db.exec("ALTER TABLE media_assets ADD COLUMN retrieval_policy TEXT;");
+    if (!try tableColumnExists(db, "media_assets", "retry_class")) try db.exec("ALTER TABLE media_assets ADD COLUMN retry_class TEXT;");
+    if (!try tableColumnExists(db, "media_assets", "attempts")) try db.exec("ALTER TABLE media_assets ADD COLUMN attempts INTEGER DEFAULT 0;");
+    if (!try tableColumnExists(db, "media_assets", "last_error_at")) try db.exec("ALTER TABLE media_assets ADD COLUMN last_error_at TEXT;");
+    if (!try tableColumnExists(db, "media_assets", "removed_at")) try db.exec("ALTER TABLE media_assets ADD COLUMN removed_at TEXT;");
+    if (!try tableColumnExists(db, "media_assets", "removal_reason")) try db.exec("ALTER TABLE media_assets ADD COLUMN removal_reason TEXT;");
+}
+
+fn tableColumnExists(db: *Db, table_name: []const u8, column_name: []const u8) !bool {
+    const sql = try std.fmt.allocPrint(std.heap.page_allocator, "PRAGMA table_info({s})", .{table_name});
+    defer std.heap.page_allocator.free(sql);
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return false;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (std.mem.eql(u8, colText(stmt, 1), column_name)) return true;
+    }
+}
+
+fn backfillMediaAssetPolicyColumns(db: *Db) !void {
+    try db.exec(
+        \\UPDATE media_assets
+        \\SET retrieval_policy = CASE
+        \\  WHEN asset_kind IN ('image', 'preview_image', 'author_avatar') THEN 'images-only'
+        \\  WHEN asset_kind IN ('video_variant', 'animated_gif_variant') AND status = 'downloaded' THEN 'all-local'
+        \\  WHEN asset_kind IN ('video_variant', 'animated_gif_variant') THEN 'images-only'
+        \\  ELSE retrieval_policy
+        \\END
+        \\WHERE retrieval_policy IS NULL;
+        \\UPDATE media_assets
+        \\SET retry_class = CASE
+        \\  WHEN status = 'downloaded' THEN NULL
+        \\  WHEN status IN ('skipped', 'remote_only') THEN 'policy'
+        \\  WHEN status = 'removed' THEN 'policy'
+        \\  WHEN status = 'failed' AND (error_json LIKE '%503%' OR error_json LIKE '%502%' OR error_json LIKE '%500%' OR error_json LIKE '%504%' OR error_json LIKE '%UnknownHostName%' OR error_json LIKE '%timeout%' OR error_json LIKE '%Timeout%' OR error_json LIKE '%connection reset%') THEN 'transient'
+        \\  WHEN status = 'failed' AND (error_json LIKE '%403%' OR error_json LIKE '%404%') THEN 'permanent'
+        \\  WHEN status = 'failed' THEN 'unknown'
+        \\  ELSE retry_class
+        \\END
+        \\WHERE retry_class IS NULL OR retry_class = '';
     );
 }
 
@@ -1875,7 +2203,7 @@ fn runBookmarkSync(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_to
         if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: committed page {} tweets_seen={} new_bookmarks={} early_stop={}\n", .{ page_number, result.tweets, result.new_bookmarks, result.early_stop_used });
         if (cfg.download_media and result.tweets > tweets_before_page) {
             if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: downloading assets for page {}\n", .{page_number});
-            try downloadAssetsFromIncludes(db, allocator, cfg.assets_dir, parsed.value);
+            try downloadAssetsFromIncludes(db, allocator, cfg.assets_dir, parsed.value, cfg.media_policy);
             if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: finished assets for page {}\n", .{page_number});
         }
         result.pages += 1;
@@ -1926,7 +2254,7 @@ fn discoverSyncWork(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_t
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
         defer parsed.deinit();
         result.pages += 1;
-        result.media_assets += countPlannedMediaAssets(parsed.value);
+        result.media_assets += countPlannedMediaAssets(parsed.value, cfg.media_policy);
 
         if (getArray(parsed.value, "data")) |tweets| {
             for (tweets.items) |tweet| {
@@ -1954,23 +2282,25 @@ fn replaceOwnedOptionalString(allocator: std.mem.Allocator, target: *?[]u8, valu
     target.* = owned;
 }
 
-fn countPlannedMediaAssets(root: std.json.Value) u32 {
+fn countPlannedMediaAssets(root: std.json.Value, media_policy: []const u8) u32 {
     var count: u32 = 0;
     const includes = getObject(root, "includes") orelse return 0;
     if (getArray(includes, "media")) |media_arr| {
         for (media_arr.items) |media| {
             if (media != .object) continue;
-            if (getString(media, "url") != null) count += 1;
-            if (getString(media, "preview_image_url") != null) count += 1;
+            if (!std.mem.eql(u8, media_policy, "metadata-only")) {
+                if (getString(media, "url") != null) count += 1;
+                if (getString(media, "preview_image_url") != null) count += 1;
+            }
             if (getArray(media, "variants")) |variants| {
-                if (variants.items.len > 0) count += 1;
+                if (variants.items.len > 0 and !std.mem.eql(u8, media_policy, "metadata-only")) count += 1;
             }
         }
     }
     if (getArray(includes, "users")) |users_arr| {
         for (users_arr.items) |user| {
             if (user != .object) continue;
-            if (getString(user, "profile_image_url") != null) count += 1;
+            if (!std.mem.eql(u8, media_policy, "metadata-only") and getString(user, "profile_image_url") != null) count += 1;
         }
     }
     return count;
@@ -2438,7 +2768,7 @@ fn assetPresentForMediaKeyKind(db: *Db, media_key: []const u8, kind: []const u8)
 }
 
 fn videoAssetPresentForMediaKey(db: *Db, media_key: []const u8) !bool {
-    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND asset_kind IN ('video_variant', 'animated_gif_variant') AND status IN ('downloaded', 'ok', 'skipped') LIMIT 1");
+    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND asset_kind IN ('video_variant', 'animated_gif_variant') AND status IN ('downloaded', 'ok', 'skipped', 'remote_only', 'removed') LIMIT 1");
     defer _ = c.sqlite3_finalize(stmt);
     try bindText(stmt, 1, media_key);
     return c.sqlite3_step(stmt) == c.SQLITE_ROW;
@@ -2846,7 +3176,7 @@ fn upsertFolderFromValue(db: *Db, allocator: std.mem.Allocator, account_user_id:
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
 }
 
-fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, root: std.json.Value) !void {
+fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, root: std.json.Value, media_policy: []const u8) !void {
     const includes = getObject(root, "includes") orelse return;
     if (getArray(includes, "media")) |media_arr| {
         for (media_arr.items) |media| {
@@ -2854,12 +3184,21 @@ fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir:
             const key = getString(media, "media_key") orelse "";
             const width = getInt(media, "width");
             const height = getInt(media, "height");
-            if (getString(media, "url")) |url| try downloadAsset(db, allocator, assets_dir, key, "image", url, width, height);
-            if (getString(media, "preview_image_url")) |url| try downloadAsset(db, allocator, assets_dir, key, "preview_image", url, width, height);
+            if (!std.mem.eql(u8, media_policy, "metadata-only")) {
+                if (getString(media, "url")) |url| try downloadAsset(db, allocator, assets_dir, key, "image", url, width, height);
+                if (getString(media, "preview_image_url")) |url| try downloadAsset(db, allocator, assets_dir, key, "preview_image", url, width, height);
+            } else {
+                if (getString(media, "url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
+                if (getString(media, "preview_image_url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "preview_image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
+            }
             if (getArray(media, "variants")) |variants| {
                 if (selectVideoVariant(variants)) |url| {
                     const kind = if (std.mem.eql(u8, getString(media, "type") orelse "", "animated_gif")) "animated_gif_variant" else "video_variant";
-                    try downloadAsset(db, allocator, assets_dir, key, kind, url, width, height);
+                    if (std.mem.eql(u8, media_policy, "all-local")) {
+                        try downloadAsset(db, allocator, assets_dir, key, kind, url, width, height);
+                    } else {
+                        try recordRemoteOnlyMediaAssetOnce(db, allocator, key, kind, url, width, height, "{\"reason\":\"local_video_disabled_by_policy\"}");
+                    }
                 } else if (variants.items.len > 0) {
                     const source = try std.fmt.allocPrint(allocator, "x-bookmarks:media:{s}:variant", .{key});
                     defer allocator.free(source);
@@ -2872,10 +3211,17 @@ fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir:
         for (users_arr.items) |user| {
             if (user != .object) continue;
             const user_id = getString(user, "id") orelse "";
-            if (getString(user, "profile_image_url")) |url| {
+            if (!std.mem.eql(u8, media_policy, "metadata-only") and getString(user, "profile_image_url") != null) {
+                const url = getString(user, "profile_image_url").?;
                 const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
                 defer allocator.free(key);
                 try downloadAsset(db, allocator, assets_dir, key, "author_avatar", url, null, null);
+            } else if (std.mem.eql(u8, media_policy, "metadata-only")) {
+                if (getString(user, "profile_image_url")) |url| {
+                    const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
+                    defer allocator.free(key);
+                    try recordSkippedMediaAssetOnce(db, allocator, key, "author_avatar", url, null, null, "{\"reason\":\"metadata_only_policy\"}");
+                }
             }
         }
     }
@@ -3044,8 +3390,10 @@ fn assetFileMatches(allocator: std.mem.Allocator, path: []const u8, expected_siz
 fn recordMediaAsset(db: *Db, allocator: std.mem.Allocator, media_key: []const u8, kind: []const u8, source_url: []const u8, local_path: []const u8, content_type: ?[]const u8, byte_size: i64, sha256: ?[]const u8, width: ?i64, height: ?i64, status: []const u8, err_json: ?[]const u8) !void {
     const now = try timestampString(allocator);
     defer allocator.free(now);
+    const retrieval_policy = defaultRetrievalPolicyForAsset(kind, status);
+    const retry_class = classifyAssetRetry(status, err_json);
     const stmt = try db.prepare(
-        "INSERT INTO media_assets(media_key, asset_kind, source_url, local_path, content_type, byte_size, sha256, width, height, status, error_json, first_seen_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO media_assets(media_key, asset_kind, source_url, local_path, content_type, byte_size, sha256, width, height, status, error_json, first_seen_at, last_checked_at, retrieval_policy, retry_class, attempts, last_error_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
     );
     defer _ = c.sqlite3_finalize(stmt);
     if (media_key.len > 0) try bindText(stmt, 1, media_key) else _ = c.sqlite3_bind_null(stmt, 1);
@@ -3061,12 +3409,38 @@ fn recordMediaAsset(db: *Db, allocator: std.mem.Allocator, media_key: []const u8
     if (err_json) |v| try bindText(stmt, 11, v) else _ = c.sqlite3_bind_null(stmt, 11);
     try bindText(stmt, 12, now);
     try bindText(stmt, 13, now);
+    try bindText(stmt, 14, retrieval_policy);
+    if (retry_class) |v| try bindText(stmt, 15, v) else _ = c.sqlite3_bind_null(stmt, 15);
+    if (err_json != null and !std.mem.eql(u8, status, "downloaded")) try bindText(stmt, 16, now) else _ = c.sqlite3_bind_null(stmt, 16);
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn defaultRetrievalPolicyForAsset(kind: []const u8, status: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, "video_variant") or std.mem.eql(u8, kind, "animated_gif_variant")) {
+        if (std.mem.eql(u8, status, "downloaded")) return "all-local";
+        return "images-only";
+    }
+    return "images-only";
+}
+
+fn classifyAssetRetry(status: []const u8, err_json: ?[]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, status, "downloaded")) return null;
+    if (std.mem.eql(u8, status, "skipped") or std.mem.eql(u8, status, "remote_only") or std.mem.eql(u8, status, "removed")) return "policy";
+    if (!std.mem.eql(u8, status, "failed")) return null;
+    const err = err_json orelse return "unknown";
+    if (containsIgnoreCase(err, "503") or containsIgnoreCase(err, "502") or containsIgnoreCase(err, "500") or containsIgnoreCase(err, "504") or containsIgnoreCase(err, "UnknownHostName") or containsIgnoreCase(err, "timeout") or containsIgnoreCase(err, "connection reset")) return "transient";
+    if (containsIgnoreCase(err, "403") or containsIgnoreCase(err, "404")) return "permanent";
+    return "unknown";
 }
 
 fn recordSkippedMediaAssetOnce(db: *Db, allocator: std.mem.Allocator, media_key: []const u8, kind: []const u8, source_url: []const u8, width: ?i64, height: ?i64, err_json: []const u8) !void {
     if (try mediaAssetRecordExists(db, media_key, kind, source_url, "skipped")) return;
     try recordMediaAsset(db, allocator, media_key, kind, source_url, "", null, 0, null, width, height, "skipped", err_json);
+}
+
+fn recordRemoteOnlyMediaAssetOnce(db: *Db, allocator: std.mem.Allocator, media_key: []const u8, kind: []const u8, source_url: []const u8, width: ?i64, height: ?i64, err_json: []const u8) !void {
+    if (try mediaAssetRecordExists(db, media_key, kind, source_url, "remote_only")) return;
+    try recordMediaAsset(db, allocator, media_key, kind, source_url, "", null, 0, null, width, height, "remote_only", err_json);
 }
 
 fn mediaAssetRecordExists(db: *Db, media_key: []const u8, kind: []const u8, source_url: []const u8, status: []const u8) !bool {
@@ -3600,12 +3974,9 @@ fn writeMediaAssetsJsonAndCopy(db: *Db, allocator: std.mem.Allocator, path: []co
             defer allocator.free(rel);
             const dest = try std.fs.path.join(allocator, &.{ export_dir, rel });
             defer allocator.free(dest);
-            if (std.fs.cwd().readFileAlloc(allocator, local_path, 1024 * 1024 * 1024)) |data| {
-                defer allocator.free(data);
-                try ensureParentDir(dest);
-                try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = data });
+            if (try copyValidatedAssetFile(allocator, local_path, dest, c.sqlite3_column_int64(stmt, 6), colText(stmt, 7), false)) {
                 viewer_path = try allocator.dupe(u8, rel);
-            } else |_| {}
+            }
         }
         defer if (viewer_path.len > 0) allocator.free(viewer_path);
         if (!first) try w.writeAll(",\n");
@@ -3685,6 +4056,837 @@ fn scalarCount(db: *Db, sql: []const u8) !i64 {
     return c.sqlite3_column_int64(stmt, 0);
 }
 
+fn resolveObsidianPaths(allocator: std.mem.Allocator, cfg: Config, vault_override: ?[]const u8) !ObsidianPaths {
+    const vault_config = vault_override orelse cfg.obsidian_vault_path orelse {
+        try std.fs.File.stderr().deprecatedWriter().writeAll("obsidian vault is not configured; run `x-bookmarks obsidian init --vault PATH` or pass `--vault PATH`\n");
+        return AppError.ConfigInvalid;
+    };
+    if (!std.fs.path.isAbsolute(vault_config)) return AppError.ConfigInvalid;
+    if (!validManagedRelativePath(cfg.obsidian_root_dir) or !validManagedRelativePath(cfg.obsidian_timeline_dir) or !validManagedRelativePath(cfg.obsidian_note_dir) or !validManagedRelativePath(cfg.obsidian_asset_dir) or !validManagedRelativePath(cfg.obsidian_index_dir) or !validManagedRelativePath(cfg.obsidian_data_dir)) return AppError.ConfigInvalid;
+    const vault = try allocator.dupe(u8, vault_config);
+    const root = try std.fs.path.join(allocator, &.{ vault, cfg.obsidian_root_dir });
+    const notes = try std.fs.path.join(allocator, &.{ root, cfg.obsidian_note_dir });
+    const assets = try std.fs.path.join(allocator, &.{ root, cfg.obsidian_asset_dir });
+    const images = try std.fs.path.join(allocator, &.{ assets, "images" });
+    const previews = try std.fs.path.join(allocator, &.{ assets, "previews" });
+    const avatars = try std.fs.path.join(allocator, &.{ assets, "avatars" });
+    const indexes = try std.fs.path.join(allocator, &.{ root, cfg.obsidian_index_dir });
+    const timeline = try std.fs.path.join(allocator, &.{ root, cfg.obsidian_timeline_dir });
+    const data = try std.fs.path.join(allocator, &.{ root, cfg.obsidian_data_dir });
+    return .{ .vault = vault, .root = root, .notes = notes, .assets = assets, .images = images, .previews = previews, .avatars = avatars, .indexes = indexes, .timeline = timeline, .data = data };
+}
+
+fn makeObsidianTimelineDirs(paths: ObsidianPaths) !void {
+    try std.fs.cwd().makePath(paths.indexes);
+    try std.fs.cwd().makePath(paths.timeline);
+    try std.fs.cwd().makePath(paths.data);
+}
+
+fn makeObsidianFullDirs(paths: ObsidianPaths) !void {
+    try makeObsidianTimelineDirs(paths);
+    try std.fs.cwd().makePath(paths.notes);
+    try std.fs.cwd().makePath(paths.images);
+    try std.fs.cwd().makePath(paths.previews);
+    try std.fs.cwd().makePath(paths.avatars);
+}
+
+fn obsidianStatus(db: *Db, allocator: std.mem.Allocator, cfg: Config, vault_override: ?[]const u8) !void {
+    var paths = try resolveObsidianPaths(allocator, cfg, vault_override);
+    defer paths.deinit(allocator);
+    const note_count = if (fileExists(paths.notes)) try countFilesWithSuffix(allocator, paths.notes, ".md") else 0;
+    const active = try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1");
+    const failed = try scalarCount(db, "SELECT count(*) FROM media_assets WHERE status = 'failed'");
+    const stale = if (fileExists(paths.notes)) try countStaleObsidianNotes(db, allocator, paths.notes) else 0;
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("vault: {s}\nmanaged root: {s}\nexport mode: {s}\nnotes dir: {s}\nassets dir: {s}\nindexes dir: {s}\ntimeline dir: {s}\ndata dir: {s}\nmedia policy: {s}\nactive bookmarks: {}\nexported notes: {}\nfailed media assets: {}\nstale notes: {}\n", .{
+        paths.vault,
+        paths.root,
+        cfg.obsidian_export_mode.label(),
+        paths.notes,
+        paths.assets,
+        paths.indexes,
+        paths.timeline,
+        paths.data,
+        cfg.media_policy,
+        active,
+        note_count,
+        failed,
+        stale,
+    });
+}
+
+fn countFilesWithSuffix(allocator: std.mem.Allocator, dir_path: []const u8, suffix: []const u8) !i64 {
+    _ = allocator;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var count: i64 = 0;
+    while (try it.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, suffix)) count += 1;
+    }
+    return count;
+}
+
+fn countStaleObsidianNotes(db: *Db, allocator: std.mem.Allocator, notes_dir: []const u8) !i64 {
+    var dir = std.fs.cwd().openDir(notes_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var count: i64 = 0;
+    while (try it.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const id = entry.name[0 .. entry.name.len - ".md".len];
+        if (!try activeBookmarkExists(db, allocator, id)) count += 1;
+    }
+    return count;
+}
+
+fn activeBookmarkExists(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    _ = allocator;
+    const stmt = try db.prepare("SELECT 1 FROM bookmark_items WHERE tweet_id=? AND active=1 LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+const TimelineWriteStats = struct {
+    months_total: u32 = 0,
+    months_written: u32 = 0,
+    months_skipped: u32 = 0,
+    index_written: bool = false,
+    index_skipped: bool = false,
+    summary_written: bool = false,
+    summary_skipped: bool = false,
+};
+
+fn obsidianExport(db: *Db, allocator: std.mem.Allocator, cfg: Config, opts: ObsidianExportOptions) !void {
+    const mode = opts.mode_override orelse cfg.obsidian_export_mode;
+    if (opts.clean_stale and mode == .timeline_only) {
+        try std.fs.File.stderr().deprecatedWriter().writeAll("--clean-stale only applies to full Obsidian export; rerun with `--mode full --clean-stale`\n");
+        return AppError.InvalidArguments;
+    }
+    switch (mode) {
+        .timeline_only => {
+            _ = try obsidianExportTimelineOnly(db, allocator, cfg, opts);
+        },
+        .full => try obsidianExportFull(db, allocator, cfg, opts),
+    }
+}
+
+fn obsidianExportTimelineOnly(db: *Db, allocator: std.mem.Allocator, cfg: Config, opts: ObsidianExportOptions) !TimelineWriteStats {
+    var paths = try resolveObsidianPaths(allocator, cfg, opts.vault_override);
+    defer paths.deinit(allocator);
+    if (!opts.dry_run) try makeObsidianTimelineDirs(paths);
+
+    var stats = try writeObsidianTimeline(db, allocator, paths, cfg.obsidian_timeline_dir, opts.dry_run, opts.changed_only);
+    stats.summary_written = try writeObsidianTimelineSummary(db, allocator, paths, stats.months_total, opts.dry_run, opts.changed_only);
+    stats.summary_skipped = !stats.summary_written;
+    if (!builtin.is_test) {
+        try std.fs.File.stdout().deprecatedWriter().print("{s}obsidian export: mode=timeline-only months={} written={} skipped={} index={s} summary={s}\n", .{
+            if (opts.dry_run) "dry-run " else "",
+            stats.months_total,
+            stats.months_written,
+            stats.months_skipped,
+            if (stats.index_written) "written" else "skipped",
+            if (stats.summary_written) "written" else "skipped",
+        });
+    }
+    return stats;
+}
+
+fn obsidianExportFull(db: *Db, allocator: std.mem.Allocator, cfg: Config, opts: ObsidianExportOptions) !void {
+    const timeline_stats = try obsidianExportTimelineOnly(db, allocator, cfg, opts);
+
+    var paths = try resolveObsidianPaths(allocator, cfg, opts.vault_override);
+    defer paths.deinit(allocator);
+    if (!opts.dry_run) try makeObsidianFullDirs(paths);
+
+    var asset_map = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = asset_map.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        asset_map.deinit();
+    }
+    const materialized = try materializeObsidianAssets(db, allocator, cfg.assets_dir, paths, opts.dry_run, &asset_map);
+    const notes = try writeObsidianNotes(db, allocator, cfg, paths, opts.dry_run, opts.changed_only, &asset_map);
+    const stale = try countStaleObsidianNotes(db, allocator, paths.notes);
+    if (opts.clean_stale and stale > 0) try markStaleObsidianNotes(allocator, paths, opts.dry_run);
+    if (!opts.dry_run) {
+        try writeObsidianIndexes(db, allocator, paths);
+        try writeObsidianSidecars(db, allocator, paths, cfg, materialized, notes);
+    }
+    if (!builtin.is_test) {
+        try std.fs.File.stdout().deprecatedWriter().print("{s}obsidian export: mode=full notes={} assets={} stale={} timeline_months={} timeline_written={}\n", .{ if (opts.dry_run) "dry-run " else "", notes, materialized, stale, timeline_stats.months_total, timeline_stats.months_written });
+    }
+}
+
+fn materializeObsidianAssets(db: *Db, allocator: std.mem.Allocator, source_assets_dir: []const u8, paths: ObsidianPaths, dry_run: bool, asset_map: *std.StringHashMap([]const u8)) !u32 {
+    const stmt = try db.prepare(
+        \\SELECT id, coalesce(media_key, ''), asset_kind, source_url, local_path, coalesce(sha256, '')
+        \\FROM media_assets
+        \\WHERE status='downloaded' AND asset_kind IN ('image', 'preview_image', 'author_avatar') AND local_path <> ''
+        \\ORDER BY id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    var count: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const media_key = colText(stmt, 1);
+        const kind = colText(stmt, 2);
+        const source_url = colText(stmt, 3);
+        const local_path = colText(stmt, 4);
+        const sha = colText(stmt, 5);
+        const source_path = try resolvedAssetLocalPath(allocator, source_assets_dir, local_path);
+        defer allocator.free(source_path);
+        const dest_dir = if (std.mem.eql(u8, kind, "image")) paths.images else if (std.mem.eql(u8, kind, "preview_image")) paths.previews else paths.avatars;
+        const rel_dir = if (std.mem.eql(u8, kind, "image")) "../assets/images" else if (std.mem.eql(u8, kind, "preview_image")) "../assets/previews" else "../assets/avatars";
+        const base_id = if (std.mem.eql(u8, kind, "author_avatar") and std.mem.startsWith(u8, media_key, "user:")) media_key["user:".len..] else media_key;
+        const ext = extensionForAsset(local_path, source_url);
+        const filename = try std.fmt.allocPrint(allocator, "{s}-{s}{s}", .{ base_id, if (sha.len > 0) sha else "unhashed", ext });
+        defer allocator.free(filename);
+        const dest = try std.fs.path.join(allocator, &.{ dest_dir, filename });
+        defer allocator.free(dest);
+        const rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, filename });
+        if (!try copyValidatedAssetFile(allocator, source_path, dest, -1, sha, dry_run)) {
+            allocator.free(rel);
+            continue;
+        }
+        const key = try std.fmt.allocPrint(allocator, "{}", .{id});
+        try asset_map.put(key, rel);
+        count += 1;
+        if (dry_run) {
+            try std.fs.File.stdout().deprecatedWriter().print("would materialize asset id={} {s}\n", .{ id, rel });
+        }
+    }
+    return count;
+}
+
+fn copyValidatedAssetFile(allocator: std.mem.Allocator, source_path: []const u8, dest_path: []const u8, expected_size: i64, expected_hash: []const u8, dry_run: bool) !bool {
+    if (!try assetFileMatches(allocator, source_path, expected_size, expected_hash)) return false;
+    if (!dry_run and !fileExists(dest_path)) {
+        try ensureParentDir(dest_path);
+        try std.fs.cwd().copyFile(source_path, std.fs.cwd(), dest_path, .{});
+    }
+    return true;
+}
+
+fn extensionForAsset(local_path: []const u8, source_url: []const u8) []const u8 {
+    const base_ext = std.fs.path.extension(local_path);
+    if (base_ext.len > 0 and base_ext.len <= 8) return base_ext;
+    return extensionForUrl(source_url);
+}
+
+fn resolvedAssetLocalPath(allocator: std.mem.Allocator, assets_dir: []const u8, local_path: []const u8) ![]const u8 {
+    if (pathUnderDir(allocator, local_path, assets_dir) and fileExists(local_path)) return allocator.dupe(u8, local_path);
+    if (std.mem.indexOf(u8, local_path, "/assets/")) |idx| {
+        const suffix = local_path[idx + "/assets/".len ..];
+        const candidate = try std.fs.path.join(allocator, &.{ assets_dir, suffix });
+        if (fileExists(candidate)) return candidate;
+        allocator.free(candidate);
+    }
+    return allocator.dupe(u8, local_path);
+}
+
+fn writeObsidianNotes(db: *Db, allocator: std.mem.Allocator, cfg: Config, paths: ObsidianPaths, dry_run: bool, changed_only: bool, asset_map: *std.StringHashMap([]const u8)) !u32 {
+    _ = cfg;
+    const stmt = try db.prepare(
+        \\SELECT b.tweet_id, b.complete_for_offline_render, coalesce(t.canonical_uri, ''), coalesce(t.twitter_uri, ''), coalesce(t.text, ''),
+        \\       coalesce(t.created_at, ''), coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''), b.last_seen_at, t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    var count: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const tweet_id = colText(stmt, 0);
+        const note_name = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
+        defer allocator.free(note_name);
+        const note_path = try std.fs.path.join(allocator, &.{ paths.notes, note_name });
+        defer allocator.free(note_path);
+        const generated = try buildObsidianNote(db, allocator, tweet_id, c.sqlite3_column_int(stmt, 1) != 0, colText(stmt, 2), colText(stmt, 3), colText(stmt, 4), colText(stmt, 5), colText(stmt, 6), colText(stmt, 7), colText(stmt, 8), colText(stmt, 9), colText(stmt, 10), asset_map);
+        defer allocator.free(generated);
+        const final = try mergeGeneratedNote(allocator, note_path, generated);
+        defer allocator.free(final);
+        if (changed_only and fileExists(note_path)) {
+            const existing = try std.fs.cwd().readFileAlloc(allocator, note_path, 8 * 1024 * 1024);
+            defer allocator.free(existing);
+            if (std.mem.eql(u8, existing, final)) continue;
+        }
+        count += 1;
+        if (dry_run) {
+            try std.fs.File.stdout().deprecatedWriter().print("would write note {s}\n", .{note_path});
+        } else {
+            try ensureParentDir(note_path);
+            try std.fs.cwd().writeFile(.{ .sub_path = note_path, .data = final });
+        }
+    }
+    return count;
+}
+
+fn buildObsidianNote(
+    db: *Db,
+    allocator: std.mem.Allocator,
+    tweet_id: []const u8,
+    complete: bool,
+    canonical_uri: []const u8,
+    twitter_uri: []const u8,
+    text: []const u8,
+    created_at: []const u8,
+    author_id: []const u8,
+    username: []const u8,
+    author_name: []const u8,
+    bookmarked_at: []const u8,
+    raw_json: []const u8,
+    asset_map: *std.StringHashMap([]const u8),
+) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    const asset_error_count = try noteAssetErrorCount(db, tweet_id, author_id);
+    const nonlocal_media_count = try noteNonlocalMediaCount(db, tweet_id, author_id);
+    const media_status = if (asset_error_count > 0 or nonlocal_media_count > 0 or !complete) "partial" else "complete";
+    try w.writeAll("---\n");
+    try w.writeAll("x_bookmarks_schema: 1\n");
+    try yamlString(w, "tweet_id", tweet_id);
+    try yamlString(w, "author_id", author_id);
+    try yamlString(w, "author_username", username);
+    try yamlString(w, "author_name", author_name);
+    try yamlString(w, "created_at", created_at);
+    try yamlString(w, "bookmarked_at", bookmarked_at);
+    try yamlString(w, "canonical_url", canonical_uri);
+    try yamlString(w, "twitter_url", twitter_uri);
+    try yamlStringArrayForQuery(db, allocator, w, "folders", "SELECT coalesce(f.name, bfi.folder_id) FROM bookmark_folder_items bfi LEFT JOIN bookmark_folders f ON f.account_user_id=bfi.account_user_id AND f.folder_id=bfi.folder_id WHERE bfi.tweet_id=? ORDER BY f.name, bfi.folder_id", tweet_id);
+    try w.print("complete_for_offline_render: {}\n", .{complete});
+    try yamlString(w, "media_status", media_status);
+    try w.print("asset_error_count: {}\n", .{asset_error_count});
+    try w.writeAll("tags:\n  - x-bookmark\n");
+    if (!complete) try w.writeAll("  - x-bookmark/incomplete\n");
+    if (asset_error_count > 0) try w.writeAll("  - x-bookmark/media-partial\n");
+    try w.writeAll("---\n\n<!-- x-bookmarks:generated:start -->\n");
+    try w.print("# @{s}\n\n", .{if (username.len > 0) username else "unknown"});
+    try writeMarkdownEscaped(w, text);
+    try w.writeAll("\n\n");
+    try writeQuotePostsMarkdown(db, allocator, w, raw_json);
+    try writeTweetMediaMarkdown(db, allocator, w, tweet_id, canonical_uri, asset_map);
+    try w.print("\n[Open on X]({s})\n\n", .{canonical_uri});
+    try writeMediaRetrievalTable(db, allocator, w, tweet_id, author_id, canonical_uri, asset_map);
+    try w.writeAll("<!-- x-bookmarks:generated:end -->\n\n## Notes\n\n<!-- User notes below this line are preserved by x-bookmarks. -->\n");
+    return out.toOwnedSlice(allocator);
+}
+
+fn yamlString(writer: anytype, name: []const u8, value: []const u8) !void {
+    try writer.print("{s}: {f}\n", .{ name, std.json.fmt(value, .{}) });
+}
+
+fn yamlStringArrayForQuery(db: *Db, allocator: std.mem.Allocator, writer: anytype, name: []const u8, sql: []const u8, bind_value: []const u8) !void {
+    var values = std.ArrayList([]const u8).empty;
+    defer {
+        for (values.items) |value| allocator.free(value);
+        values.deinit(allocator);
+    }
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, bind_value);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try values.append(allocator, try allocator.dupe(u8, colText(stmt, 0)));
+    }
+    if (values.items.len == 0) {
+        try writer.print("{s}: []\n", .{name});
+    } else {
+        try writer.print("{s}:\n", .{name});
+        for (values.items) |value| try writer.print("  - {f}\n", .{std.json.fmt(value, .{})});
+    }
+}
+
+fn writeMarkdownEscaped(writer: anytype, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        if (ch == '\\' or ch == '`' or ch == '*' or ch == '_' or ch == '[' or ch == ']' or ch == '<' or ch == '>') try writer.writeByte('\\');
+        try writer.writeByte(ch);
+    }
+}
+
+fn mergeGeneratedNote(allocator: std.mem.Allocator, path: []const u8, generated: []const u8) ![]const u8 {
+    if (!fileExists(path)) return allocator.dupe(u8, generated);
+    const existing = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    defer allocator.free(existing);
+    const end_marker = "<!-- x-bookmarks:generated:end -->";
+    const end = std.mem.indexOf(u8, existing, end_marker) orelse {
+        const conflict = try std.fmt.allocPrint(allocator, "{s}.conflict", .{path});
+        defer allocator.free(conflict);
+        try std.fs.cwd().writeFile(.{ .sub_path = conflict, .data = generated });
+        return allocator.dupe(u8, existing);
+    };
+    const preserve_start = end + end_marker.len;
+    const generated_end = std.mem.indexOf(u8, generated, end_marker) orelse generated.len;
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll(generated[0 .. @min(generated.len, generated_end + end_marker.len)]);
+    try w.writeAll(existing[preserve_start..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn noteAssetErrorCount(db: *Db, tweet_id: []const u8, author_id: []const u8) !i64 {
+    const stmt = try db.prepare(
+        \\SELECT count(*)
+        \\FROM media_assets ma
+        \\WHERE ma.status = 'failed'
+        \\  AND (
+        \\    ma.media_key IN (SELECT media_key FROM tweet_media WHERE tweet_id=?)
+        \\    OR ma.media_key = ?
+        \\  )
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var avatar_key_buf: [256]u8 = undefined;
+    const avatar_key = std.fmt.bufPrint(&avatar_key_buf, "user:{s}", .{author_id}) catch "";
+    try bindText(stmt, 2, avatar_key);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return AppError.SqliteError;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn noteNonlocalMediaCount(db: *Db, tweet_id: []const u8, author_id: []const u8) !i64 {
+    const stmt = try db.prepare(
+        \\SELECT count(*)
+        \\FROM media_assets ma
+        \\WHERE ma.status IN ('skipped', 'remote_only', 'removed')
+        \\  AND (
+        \\    ma.media_key IN (SELECT media_key FROM tweet_media WHERE tweet_id=?)
+        \\    OR ma.media_key = ?
+        \\  )
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var avatar_key_buf: [256]u8 = undefined;
+    const avatar_key = std.fmt.bufPrint(&avatar_key_buf, "user:{s}", .{author_id}) catch "";
+    try bindText(stmt, 2, avatar_key);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return AppError.SqliteError;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn writeQuotePostsMarkdown(db: *Db, allocator: std.mem.Allocator, writer: anytype, raw_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return;
+    defer parsed.deinit();
+    const refs = getArray(parsed.value, "referenced_tweets") orelse return;
+    for (refs.items) |ref| {
+        if (ref != .object) continue;
+        if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+        const quote_id = getString(ref, "id") orelse continue;
+        const stmt = try db.prepare(
+            \\SELECT coalesce(t.text, ''), coalesce(t.canonical_uri, ''), coalesce(u.username, '')
+            \\FROM tweets t
+            \\LEFT JOIN users u ON u.user_id=t.author_id
+            \\WHERE t.tweet_id=?
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, quote_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) continue;
+        try writer.print("> Quoted @{s}: ", .{if (colText(stmt, 2).len > 0) colText(stmt, 2) else "unknown"});
+        try writeMarkdownEscaped(writer, colText(stmt, 0));
+        try writer.print("\n> [Open quoted post]({s})\n\n", .{colText(stmt, 1)});
+    }
+}
+
+fn writeTweetMediaMarkdown(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, canonical_uri: []const u8, asset_map: *std.StringHashMap([]const u8)) !void {
+    const stmt = try db.prepare(
+        \\SELECT ma.id, ma.asset_kind, ma.status, ma.source_url
+        \\FROM tweet_media tm
+        \\JOIN media_assets ma ON ma.media_key=tm.media_key
+        \\WHERE tm.tweet_id=?
+        \\ORDER BY tm.position, ma.id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const kind = colText(stmt, 1);
+        const status = colText(stmt, 2);
+        const key = try std.fmt.allocPrint(allocator, "{}", .{id});
+        defer allocator.free(key);
+        if (asset_map.get(key)) |rel| {
+            if (std.mem.eql(u8, kind, "preview_image")) {
+                try writer.print("[![Video preview]({s})]({s})\n\n", .{ rel, canonical_uri });
+            } else if (std.mem.eql(u8, kind, "image")) {
+                try writer.print("![Image]({s})\n\n", .{rel});
+            }
+        } else if (std.mem.eql(u8, status, "remote_only")) {
+            try writer.print("[Remote video]({s})\n\n", .{canonical_uri});
+        }
+    }
+}
+
+fn writeMediaRetrievalTable(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, author_id: []const u8, canonical_uri: []const u8, asset_map: *std.StringHashMap([]const u8)) !void {
+    try writer.writeAll("Media retrieval:\n\n| Kind | Status | Detail |\n| --- | --- | --- |\n");
+    const stmt = try db.prepare(
+        \\SELECT ma.id, ma.asset_kind, ma.status, ma.source_url, coalesce(ma.error_json, ''), coalesce(ma.retry_class, '')
+        \\FROM media_assets ma
+        \\WHERE ma.media_key IN (SELECT media_key FROM tweet_media WHERE tweet_id=?)
+        \\   OR ma.media_key=?
+        \\ORDER BY ma.asset_kind, ma.id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var avatar_key_buf: [256]u8 = undefined;
+    const avatar_key = std.fmt.bufPrint(&avatar_key_buf, "user:{s}", .{author_id}) catch "";
+    try bindText(stmt, 2, avatar_key);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const kind = colText(stmt, 1);
+        const status = colText(stmt, 2);
+        const source = colText(stmt, 3);
+        const err = colText(stmt, 4);
+        const key = try std.fmt.allocPrint(allocator, "{}", .{id});
+        defer allocator.free(key);
+        const is_video = std.mem.eql(u8, kind, "video_variant") or std.mem.eql(u8, kind, "animated_gif_variant");
+        const display_status = if (is_video and std.mem.eql(u8, status, "downloaded")) "remote_only" else status;
+        const detail = asset_map.get(key) orelse if (is_video) canonical_uri else if (std.mem.eql(u8, status, "remote_only")) source else if (err.len > 0) err else "";
+        try writer.print("| {s} | {s} | `{s}` |\n", .{ kind, display_status, detail });
+    }
+    try writer.writeAll("\n");
+}
+
+fn markStaleObsidianNotes(allocator: std.mem.Allocator, paths: ObsidianPaths, dry_run: bool) !void {
+    const inactive_path = try std.fs.path.join(allocator, &.{ paths.indexes, "inactive.md" });
+    defer allocator.free(inactive_path);
+    if (dry_run) {
+        try std.fs.File.stdout().deprecatedWriter().writeAll("would write stale-note inactive index\n");
+    } else {
+        try ensureParentDir(inactive_path);
+        try std.fs.cwd().writeFile(.{ .sub_path = inactive_path, .data = "# Inactive Bookmarks\n\nStale generated notes are retained in place so user notes are not deleted.\n" });
+    }
+}
+
+fn writeObsidianIndexes(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths) !void {
+    const all_path = try std.fs.path.join(allocator, &.{ paths.indexes, "all-bookmarks.md" });
+    defer allocator.free(all_path);
+    const incomplete_path = try std.fs.path.join(allocator, &.{ paths.indexes, "incomplete.md" });
+    defer allocator.free(incomplete_path);
+    const failed_path = try std.fs.path.join(allocator, &.{ paths.indexes, "failed-assets.md" });
+    defer allocator.free(failed_path);
+    try writeAllBookmarksIndex(db, allocator, all_path);
+    try writeIncompleteIndex(db, allocator, incomplete_path);
+    try writeFailedAssetsIndex(db, allocator, failed_path);
+}
+
+fn writeAllBookmarksIndex(db: *Db, allocator: std.mem.Allocator, path: []const u8) !void {
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll("# All Bookmarks\n\n");
+    const stmt = try db.prepare(
+        \\SELECT b.tweet_id, coalesce(u.username, ''), coalesce(t.created_at, ''), coalesce(t.text, '')
+        \\FROM bookmark_items b JOIN tweets t ON t.tweet_id=b.tweet_id LEFT JOIN users u ON u.user_id=t.author_id
+        \\WHERE b.active=1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try w.print("- [[{s}]] @{s} {s} - ", .{ colText(stmt, 0), colText(stmt, 1), colText(stmt, 2) });
+        try writeMarkdownEscaped(w, shortText(colText(stmt, 3)));
+        try w.writeAll("\n");
+    }
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+}
+
+fn shortText(text: []const u8) []const u8 {
+    return if (text.len > 120) text[0..120] else text;
+}
+
+fn writeIncompleteIndex(db: *Db, allocator: std.mem.Allocator, path: []const u8) !void {
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll("# Incomplete Bookmarks\n\n");
+    const stmt = try db.prepare("SELECT tweet_id FROM bookmark_items WHERE active=1 AND complete_for_offline_render=0 ORDER BY import_position IS NULL, import_position, tweet_id DESC");
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try w.print("- [[{s}]]\n", .{colText(stmt, 0)});
+    }
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+}
+
+fn writeObsidianTimeline(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, timeline_dir_name: []const u8, dry_run: bool, changed_only: bool) !TimelineWriteStats {
+    if (!dry_run) try std.fs.cwd().makePath(paths.timeline);
+    const stmt = try db.prepare(
+        \\SELECT coalesce(t.created_at, ''), coalesce(t.canonical_uri, '')
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id=b.tweet_id
+        \\WHERE b.active=1
+        \\ORDER BY substr(coalesce(t.created_at, ''), 1, 7) DESC, coalesce(t.created_at, '') DESC, b.import_position IS NULL, b.import_position, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+
+    var current_month: ?[]const u8 = null;
+    defer if (current_month) |value| allocator.free(value);
+    var current_day: ?[]const u8 = null;
+    defer if (current_day) |value| allocator.free(value);
+    var month_doc = std.ArrayList(u8).empty;
+    defer month_doc.deinit(allocator);
+    var timeline_index = std.ArrayList(u8).empty;
+    defer timeline_index.deinit(allocator);
+    try timeline_index.writer(allocator).writeAll("# Timeline\n\n");
+    var stats = TimelineWriteStats{};
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const created_at = colText(stmt, 0);
+        const month = timelineMonth(created_at);
+        if (current_month == null or !std.mem.eql(u8, current_month.?, month)) {
+            if (current_month) |existing| {
+                const written = try writeTimelineMonthFile(allocator, paths, existing, month_doc.items, dry_run, changed_only);
+                if (written) stats.months_written += 1 else stats.months_skipped += 1;
+                month_doc.clearRetainingCapacity();
+                allocator.free(existing);
+            }
+            if (current_day) |existing_day| {
+                allocator.free(existing_day);
+                current_day = null;
+            }
+            current_month = try allocator.dupe(u8, month);
+            stats.months_total += 1;
+            try month_doc.writer(allocator).print("# {s}\n\n", .{month});
+            try timeline_index.writer(allocator).print("- [{s}](../{s}/{s}/{s}.md)\n", .{ month, timeline_dir_name, timelineYear(month), month });
+        }
+        const day = timelineDay(created_at);
+        if (current_day == null or !std.mem.eql(u8, current_day.?, day)) {
+            if (current_day) |existing_day| allocator.free(existing_day);
+            current_day = try allocator.dupe(u8, day);
+            try month_doc.writer(allocator).print("## {s}\n\n", .{day});
+        }
+        try appendTimelineEntry(month_doc.writer(allocator), colText(stmt, 1));
+    }
+    if (current_month) |month| {
+        const written = try writeTimelineMonthFile(allocator, paths, month, month_doc.items, dry_run, changed_only);
+        if (written) stats.months_written += 1 else stats.months_skipped += 1;
+    }
+    const timeline_index_path = try std.fs.path.join(allocator, &.{ paths.indexes, "timeline.md" });
+    defer allocator.free(timeline_index_path);
+    stats.index_written = try writeGeneratedFile(allocator, timeline_index_path, timeline_index.items, "timeline index", dry_run, changed_only);
+    stats.index_skipped = !stats.index_written;
+    return stats;
+}
+
+fn timelineMonth(created_at: []const u8) []const u8 {
+    if (created_at.len >= 7 and created_at[4] == '-') return created_at[0..7];
+    return "unknown";
+}
+
+fn timelineYear(month: []const u8) []const u8 {
+    if (month.len >= 4) return month[0..4];
+    return "unknown";
+}
+
+fn timelineDay(created_at: []const u8) []const u8 {
+    if (created_at.len >= 10) return created_at[0..10];
+    return "unknown date";
+}
+
+fn writeTimelineMonthFile(allocator: std.mem.Allocator, paths: ObsidianPaths, month: []const u8, data: []const u8, dry_run: bool, changed_only: bool) !bool {
+    const year_dir = try std.fs.path.join(allocator, &.{ paths.timeline, timelineYear(month) });
+    defer allocator.free(year_dir);
+    if (!dry_run) try std.fs.cwd().makePath(year_dir);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{month});
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ year_dir, filename });
+    defer allocator.free(path);
+    return writeGeneratedFile(allocator, path, data, "timeline month", dry_run, changed_only);
+}
+
+fn appendTimelineEntry(writer: anytype, canonical_uri: []const u8) !void {
+    try writer.print("![]({s})\n\n", .{canonical_uri});
+}
+
+fn writeGeneratedFile(allocator: std.mem.Allocator, path: []const u8, data: []const u8, label: []const u8, dry_run: bool, changed_only: bool) !bool {
+    if (changed_only and fileExists(path)) {
+        const existing = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+        defer allocator.free(existing);
+        if (std.mem.eql(u8, existing, data)) return false;
+    }
+    if (dry_run) {
+        try std.fs.File.stdout().deprecatedWriter().print("would write {s} {s}\n", .{ label, path });
+    } else {
+        try ensureParentDir(path);
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+    }
+    return true;
+}
+
+fn writeObsidianTimelineSummary(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, timeline_months: u32, dry_run: bool, changed_only: bool) !bool {
+    const summary_path = try std.fs.path.join(allocator, &.{ paths.data, "export-summary.json" });
+    defer allocator.free(summary_path);
+    const active = try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active=1");
+    const summary = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"export_mode\": \"timeline-only\",\n  \"active_bookmarks\": {},\n  \"timeline_months\": {}\n}}\n",
+        .{ active, timeline_months },
+    );
+    defer allocator.free(summary);
+    return writeGeneratedFile(allocator, summary_path, summary, "timeline summary", dry_run, changed_only);
+}
+
+fn writeFailedAssetsIndex(db: *Db, allocator: std.mem.Allocator, path: []const u8) !void {
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll("# Failed Assets\n\nRetry examples:\n\n```bash\nx-bookmarks assets retry --only-transient\nx-bookmarks assets retry --kind image\n```\n\n");
+    const stmt = try db.prepare("SELECT coalesce(retry_class, 'unknown'), asset_kind, count(*) FROM media_assets WHERE status='failed' GROUP BY retry_class, asset_kind ORDER BY retry_class, asset_kind");
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try w.print("- {s} / {s}: {}\n", .{ colText(stmt, 0), colText(stmt, 1), c.sqlite3_column_int64(stmt, 2) });
+    }
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+}
+
+fn writeObsidianSidecars(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, cfg: Config, materialized_assets: u32, exported_notes: u32) !void {
+    const bookmarks_path = try std.fs.path.join(allocator, &.{ paths.data, "bookmarks-index.json" });
+    defer allocator.free(bookmarks_path);
+    const media_path = try std.fs.path.join(allocator, &.{ paths.data, "media-assets-index.json" });
+    defer allocator.free(media_path);
+    const summary_path = try std.fs.path.join(allocator, &.{ paths.data, "export-summary.json" });
+    defer allocator.free(summary_path);
+    try writeQueryJsonArray(db, allocator, bookmarks_path,
+        \\SELECT b.tweet_id, b.account_user_id, b.complete_for_offline_render, coalesce(t.canonical_uri, ''), coalesce(t.created_at, ''), coalesce(u.username, ''), coalesce(t.text, '')
+        \\FROM bookmark_items b JOIN tweets t ON t.tweet_id=b.tweet_id LEFT JOIN users u ON u.user_id=t.author_id
+        \\WHERE b.active=1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    , &.{ "tweet_id", "account_user_id", "complete_for_offline_render:bool", "canonical_uri", "created_at", "author_username", "text" });
+    try writeQueryJsonArray(db, allocator, media_path,
+        \\SELECT id, coalesce(media_key, ''), asset_kind, source_url, local_path, coalesce(content_type, ''), coalesce(byte_size, 0), coalesce(sha256, ''), status, coalesce(error_json, ''), coalesce(retrieval_policy, ''), coalesce(retry_class, ''), coalesce(attempts, 0), coalesce(removed_at, ''), coalesce(removal_reason, '')
+        \\FROM media_assets
+        \\ORDER BY id
+    , &.{ "id:int", "media_key", "asset_kind", "source_url", "local_path", "content_type", "byte_size:int", "sha256", "status", "error_json", "retrieval_policy", "retry_class", "attempts:int", "removed_at", "removal_reason" });
+    const generated = try timestampString(allocator);
+    defer allocator.free(generated);
+    const active = try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active=1");
+    const failed = try scalarCount(db, "SELECT count(*) FROM media_assets WHERE status='failed'");
+    const remote = try scalarCount(db, "SELECT count(*) FROM media_assets WHERE status IN ('remote_only', 'removed', 'skipped')");
+    const summary = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"generated_at\": \"{s}\",\n  \"media_policy\": {f},\n  \"active_bookmarks\": {},\n  \"exported_notes\": {},\n  \"materialized_assets\": {},\n  \"failed_media_assets\": {},\n  \"nonlocal_media_assets\": {}\n}}\n",
+        .{ generated, std.json.fmt(cfg.media_policy, .{}), active, exported_notes, materialized_assets, failed, remote },
+    );
+    defer allocator.free(summary);
+    try ensureParentDir(summary_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = summary_path, .data = summary });
+}
+
+fn writeObsidianConfig(allocator: std.mem.Allocator, config_path: []const u8, vault_path: []const u8, root_dir: []const u8) !void {
+    const text = try std.fs.cwd().readFileAlloc(allocator, config_path, 4 * 1024 * 1024);
+    defer allocator.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return AppError.ConfigInvalid;
+
+    const json_allocator = parsed.arena.allocator();
+    var obs = std.json.ObjectMap.init(json_allocator);
+    try obs.put("vault_path", .{ .string = vault_path });
+    try obs.put("root_dir", .{ .string = root_dir });
+    try obs.put("export_mode", .{ .string = "timeline-only" });
+    try obs.put("timeline_dir", .{ .string = "timeline" });
+    try obs.put("index_dir", .{ .string = "indexes" });
+    try obs.put("data_dir", .{ .string = "data" });
+    try obs.put("media_policy", .{ .string = "images-only" });
+    try parsed.value.object.put("obsidian", .{ .object = obs });
+
+    const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(out);
+    const with_newline = try std.fmt.allocPrint(allocator, "{s}\n", .{out});
+    defer allocator.free(with_newline);
+    try writePrivateFile(config_path, with_newline);
+}
+
+fn obsidianMigrateMedia(db: *Db, allocator: std.mem.Allocator, cfg: Config, dry_run: bool) !void {
+    const stmt = try db.prepare(
+        \\SELECT id, local_path, coalesce(byte_size, 0), coalesce(sha256, ''), source_url
+        \\FROM media_assets
+        \\WHERE asset_kind IN ('video_variant', 'animated_gif_variant') AND status='downloaded'
+        \\ORDER BY id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    var eligible: u32 = 0;
+    var missing: u32 = 0;
+    var recoverable: i64 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const path = try allocator.dupe(u8, colText(stmt, 1));
+        defer allocator.free(path);
+        const byte_size = c.sqlite3_column_int64(stmt, 2);
+        const sha = colText(stmt, 3);
+        const source = colText(stmt, 4);
+        if (source.len == 0 or sha.len == 0) continue;
+        const resolved_path = try resolvedAssetLocalPath(allocator, cfg.assets_dir, path);
+        defer allocator.free(resolved_path);
+        eligible += 1;
+        if (fileExists(resolved_path)) {
+            recoverable += byte_size;
+        } else {
+            missing += 1;
+        }
+        if (!dry_run) {
+            if (!pathUnderDir(allocator, resolved_path, cfg.assets_dir)) return AppError.ConfigInvalid;
+            if (fileExists(resolved_path)) try std.fs.cwd().deleteFile(resolved_path);
+            try markMediaAssetRemoved(db, allocator, id);
+        }
+    }
+    try std.fs.File.stdout().deprecatedWriter().print("video/GIF local assets eligible for removal: {}\nbytes recoverable: {}\ndatabase rows to mark removed: {}\nfiles missing already: {}\n", .{ eligible, recoverable, eligible, missing });
+    if (!dry_run) try refreshCompletenessForAllActiveBookmarks(db, allocator);
+}
+
+fn pathUnderDir(allocator: std.mem.Allocator, path: []const u8, dir: []const u8) bool {
+    const abs_path = absolutize(allocator, path) catch return false;
+    defer allocator.free(abs_path);
+    const abs_dir = absolutize(allocator, dir) catch return false;
+    defer allocator.free(abs_dir);
+    return std.mem.eql(u8, abs_path, abs_dir) or (std.mem.startsWith(u8, abs_path, abs_dir) and abs_path.len > abs_dir.len and (abs_path[abs_dir.len] == '/' or abs_path[abs_dir.len] == '\\'));
+}
+
+fn markMediaAssetRemoved(db: *Db, allocator: std.mem.Allocator, id: i64) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare("UPDATE media_assets SET status='removed', removed_at=?, removal_reason='images-only media policy; remote playback retained', retrieval_policy='images-only', retry_class='policy', last_checked_at=? WHERE id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, now);
+    try bindText(stmt, 2, now);
+    _ = c.sqlite3_bind_int64(stmt, 3, id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+
+
 fn assetsVerify(db: *Db, allocator: std.mem.Allocator) !void {
     const stmt = try db.prepare("SELECT id, local_path, coalesce(byte_size, -1), coalesce(sha256, ''), status FROM media_assets WHERE status IN ('downloaded', 'ok')");
     defer _ = c.sqlite3_finalize(stmt);
@@ -3721,6 +4923,67 @@ fn assetsVerify(db: *Db, allocator: std.mem.Allocator) !void {
     }
     try std.fs.File.stdout().deprecatedWriter().print("assets checked: {}\nasset failures: {}\n", .{ checked, failed });
     if (failed > 0) return AppError.IoError;
+}
+
+fn assetsRetry(db: *Db, allocator: std.mem.Allocator, cfg: Config, opts: AssetRetryOptions) !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    const stmt = try db.prepare(
+        \\SELECT id, coalesce(media_key, ''), asset_kind, source_url, coalesce(width, 0), coalesce(height, 0), coalesce(attempts, 0), coalesce(retry_class, 'unknown')
+        \\FROM media_assets
+        \\WHERE status = 'failed'
+        \\  AND (? IS NULL OR asset_kind = ?)
+        \\  AND coalesce(attempts, 0) < ?
+        \\  AND (? = 0 OR coalesce(retry_class, 'unknown') = 'transient')
+        \\  AND NOT (? = 'images-only' AND asset_kind IN ('video_variant', 'animated_gif_variant'))
+        \\ORDER BY id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    if (opts.kind) |kind| {
+        try bindText(stmt, 1, kind);
+        try bindText(stmt, 2, kind);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 1);
+        _ = c.sqlite3_bind_null(stmt, 2);
+    }
+    _ = c.sqlite3_bind_int(stmt, 3, @intCast(opts.max_attempts));
+    _ = c.sqlite3_bind_int(stmt, 4, if (opts.only_transient) 1 else 0);
+    try bindText(stmt, 5, cfg.media_policy);
+
+    var planned: u32 = 0;
+    var attempted: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        planned += 1;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const media_key = try allocator.dupe(u8, colText(stmt, 1));
+        defer allocator.free(media_key);
+        const kind = try allocator.dupe(u8, colText(stmt, 2));
+        defer allocator.free(kind);
+        const source_url = try allocator.dupe(u8, colText(stmt, 3));
+        defer allocator.free(source_url);
+        const width_raw = c.sqlite3_column_int64(stmt, 4);
+        const height_raw = c.sqlite3_column_int64(stmt, 5);
+        const retry_class = colText(stmt, 7);
+        try out.print("{s}retry asset id={} kind={s} media_key={s} class={s}\n", .{ if (opts.dry_run) "would " else "", id, kind, media_key, retry_class });
+        if (!opts.dry_run) {
+            attempted += 1;
+            try incrementAssetAttempt(db, allocator, id);
+            try downloadAsset(db, allocator, cfg.assets_dir, media_key, kind, source_url, if (width_raw > 0) width_raw else null, if (height_raw > 0) height_raw else null);
+        }
+    }
+    try out.print("retry candidates: {}\nretry attempts: {}\n", .{ planned, attempted });
+}
+
+fn incrementAssetAttempt(db: *Db, allocator: std.mem.Allocator, id: i64) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare("UPDATE media_assets SET attempts=coalesce(attempts, 0)+1, last_checked_at=? WHERE id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, now);
+    _ = c.sqlite3_bind_int64(stmt, 2, id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
 }
 
 fn serveDirectory(allocator: std.mem.Allocator, root: []const u8, port: u16) !void {
@@ -4362,6 +5625,16 @@ test "config validation requires offline access scope for refreshable sync" {
         .token_path = "oauth-token.json",
         .assets_dir = "assets",
         .export_dir = "viewer-export",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -4386,6 +5659,16 @@ test "config validation rejects unsupported quote post depth" {
         .token_path = "oauth-token.json",
         .assets_dir = "assets",
         .export_dir = "viewer-export",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -4412,6 +5695,16 @@ test "sync CLI overrides mutate only per-run sync settings" {
         .token_path = "oauth-token.json",
         .assets_dir = "assets",
         .export_dir = "viewer-export",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -4647,6 +5940,16 @@ test "token observations persist refresh metadata without storing token secrets"
         .token_path = "/tmp/oauth-token.json",
         .assets_dir = ".",
         .export_dir = ".",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -4925,6 +6228,16 @@ test "bookmark page ingestion can be committed as a single page transaction" {
         .token_path = "token.json",
         .assets_dir = ".",
         .export_dir = ".",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -4971,6 +6284,16 @@ test "empty bookmark page stores raw page without bookmark rows" {
         .token_path = "token.json",
         .assets_dir = ".",
         .export_dir = ".",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -5018,6 +6341,16 @@ test "incremental page ingestion stops at first complete bookmark" {
         .token_path = "token.json",
         .assets_dir = ".",
         .export_dir = ".",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -5071,6 +6404,16 @@ test "partial response with errors and data still ingests available bookmark dat
         .token_path = "token.json",
         .assets_dir = ".",
         .export_dir = ".",
+        .obsidian_vault_path = null,
+        .obsidian_root_dir = "X Bookmarks",
+        .obsidian_export_mode = .timeline_only,
+        .obsidian_timeline_dir = "timeline",
+        .obsidian_note_dir = "bookmarks",
+        .obsidian_asset_dir = "assets",
+        .obsidian_index_dir = "indexes",
+        .obsidian_data_dir = "data",
+        .obsidian_preserve_user_notes = true,
+        .media_policy = "images-only",
         .max_results = 100,
         .store_raw_pages = true,
         .download_media = true,
@@ -5159,6 +6502,115 @@ test "missing quoted post references are recorded" {
     try recordMissingQuoteReferences(&db, allocator, parsed.value, parsed.value);
 
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM missing_references WHERE tweet_id = '101' AND referenced_tweet_id = '999'"));
+}
+
+test "timeline-only obsidian export writes only timeline index and summary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try absolutize(allocator, base_rel);
+    const db_path = try std.fs.path.join(allocator, &.{ base, "obsidian-timeline.sqlite" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"100","author_id":"1","text":"timeline text should not be exported","created_at":"2026-05-07T10:11:12.000Z"}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "100", run_id, 0, true);
+
+    const config_paths = try resolvePaths(allocator, null, base);
+    var cfg = try Config.default(allocator, config_paths, base);
+    const vault = try std.fs.path.join(allocator, &.{ base, "Vault" });
+    cfg.obsidian_vault_path = vault;
+
+    var stats = try obsidianExportTimelineOnly(&db, allocator, cfg, .{});
+    try std.testing.expectEqual(@as(u32, 1), stats.months_total);
+    try std.testing.expectEqual(@as(u32, 1), stats.months_written);
+    try std.testing.expect(stats.index_written);
+    try std.testing.expect(stats.summary_written);
+
+    const root = try std.fs.path.join(allocator, &.{ vault, "X Bookmarks" });
+    const month_path = try std.fs.path.join(allocator, &.{ root, "timeline", "2026", "2026-05.md" });
+    const month = try std.fs.cwd().readFileAlloc(allocator, month_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, month, "# 2026-05") != null);
+    try std.testing.expect(std.mem.indexOf(u8, month, "## 2026-05-07") != null);
+    try std.testing.expect(std.mem.indexOf(u8, month, "![](https://x.com/alice/status/100)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, month, "timeline text should not be exported") == null);
+
+    const timeline_index = try std.fs.path.join(allocator, &.{ root, "indexes", "timeline.md" });
+    const summary = try std.fs.path.join(allocator, &.{ root, "data", "export-summary.json" });
+    try std.testing.expect(fileExists(timeline_index));
+    try std.testing.expect(fileExists(summary));
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ root, "bookmarks", "100.md" })));
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ root, "assets" })));
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "all-bookmarks.md" })));
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ root, "data", "bookmarks-index.json" })));
+    try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ root, "data", "media-assets-index.json" })));
+
+    stats = try obsidianExportTimelineOnly(&db, allocator, cfg, .{ .changed_only = true });
+    try std.testing.expectEqual(@as(u32, 0), stats.months_written);
+    try std.testing.expectEqual(@as(u32, 1), stats.months_skipped);
+    try std.testing.expect(!stats.index_written);
+    try std.testing.expect(!stats.summary_written);
+}
+
+test "full obsidian export is explicit and writes notes assets and diagnostic indexes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try absolutize(allocator, base_rel);
+    const db_path = try std.fs.path.join(allocator, &.{ base, "obsidian-full.sqlite" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"2\",\"username\":\"bob\",\"name\":\"Bob\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"200","author_id":"2","text":"full export text","created_at":"2026-06-01T01:02:03.000Z"}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "200", run_id, 0, true);
+
+    const source_asset = try std.fs.path.join(allocator, &.{ base, "assets", "photo.jpg" });
+    try ensureParentDir(source_asset);
+    try std.fs.cwd().writeFile(.{ .sub_path = source_asset, .data = "image bytes" });
+    try recordMediaAsset(&db, allocator, "3_full", "image", "https://example.invalid/photo.jpg", source_asset, "image/jpeg", 11, null, null, null, "downloaded", null);
+
+    const config_paths = try resolvePaths(allocator, null, base);
+    var cfg = try Config.default(allocator, config_paths, base);
+    const vault = try std.fs.path.join(allocator, &.{ base, "Vault" });
+    cfg.obsidian_vault_path = vault;
+    cfg.assets_dir = try std.fs.path.join(allocator, &.{ base, "assets" });
+
+    try obsidianExport(&db, allocator, cfg, .{ .mode_override = .full });
+
+    const root = try std.fs.path.join(allocator, &.{ vault, "X Bookmarks" });
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "timeline", "2026", "2026-06.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "bookmarks", "200.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "assets", "images", "3_full-unhashed.jpg" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "all-bookmarks.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "failed-assets.md" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "data", "bookmarks-index.json" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "data", "media-assets-index.json" })));
 }
 
 test "missing quoted post references preserve protected error status" {

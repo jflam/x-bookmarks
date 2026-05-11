@@ -20,5 +20,14 @@
   },
   "viewer": {
     "export_dir": "~/.local/share/x-bookmarks/viewer-export"
+  },
+  "obsidian": {
+    "vault_path": null,
+    "root_dir": "X Bookmarks",
+    "export_mode": "timeline-only",
+    "timeline_dir": "timeline",
+    "index_dir": "indexes",
+    "data_dir": "data",
+    "media_policy": "images-only"
   }
 }
