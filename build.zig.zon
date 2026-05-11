@@ -1,0 +1,17 @@
+.{
+    .name = .x_bookmarks,
+    .version = "0.1.0",
+    .fingerprint = 0xf9a20a712e84979c,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "config.example.json",
+        "src",
+        "tests",
+        "vendor",
+        "viewer",
+    },
+}

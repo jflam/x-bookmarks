@@ -1,0 +1,24 @@
+{
+  "x": {
+    "client_id": "your-client-id",
+    "client_secret": null,
+    "redirect_uri": "http://127.0.0.1:8765/callback",
+    "scopes": ["tweet.read", "users.read", "bookmark.read", "offline.access"]
+  },
+  "storage": {
+    "database_path": "~/.local/share/x-bookmarks/x_bookmarks.sqlite",
+    "token_path": "~/.local/share/x-bookmarks/oauth-token.json",
+    "assets_dir": "~/.local/share/x-bookmarks/assets"
+  },
+  "sync": {
+    "max_results": 100,
+    "store_raw_pages": true,
+    "download_media": true,
+    "quote_post_depth": 1,
+    "require_approval": true,
+    "stop_at_first_complete_bookmark": true
+  },
+  "viewer": {
+    "export_dir": "~/.local/share/x-bookmarks/viewer-export"
+  }
+}

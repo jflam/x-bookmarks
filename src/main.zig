@@ -1,0 +1,5705 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const c = @cImport({
+    @cInclude("sqlite3.h");
+});
+
+const AppError = error{
+    InvalidCommand,
+    InvalidArguments,
+    MissingHome,
+    MissingConfig,
+    ConfigExists,
+    ConfigInvalid,
+    SqliteError,
+    AuthRequired,
+    HttpError,
+    RateLimited,
+    IoError,
+};
+
+const default_scopes = "tweet.read users.read bookmark.read offline.access";
+const x_api_base = "https://api.x.com/2";
+const bookmark_tweet_fields = "id,text,author_id,created_at,conversation_id,display_text_range,entities,context_annotations,attachments,referenced_tweets,public_metrics,lang,possibly_sensitive,source,note_tweet,card_uri,article";
+const bookmark_expansions = "author_id,attachments.media_keys,attachments.poll_ids,referenced_tweets.id,referenced_tweets.id.author_id,referenced_tweets.id.attachments.media_keys";
+const bookmark_user_fields = "id,name,username,description,created_at,verified,verified_type,profile_image_url,profile_banner_url,public_metrics,url,location,protected";
+const bookmark_media_fields = "media_key,type,url,preview_image_url,width,height,alt_text,duration_ms,public_metrics,variants";
+const bookmark_poll_fields = "id,options,duration_minutes,end_datetime,voting_status";
+const config_template =
+    \\{
+    \\  "x": {
+    \\    "client_id": "your-client-id",
+    \\    "client_secret": null,
+    \\    "redirect_uri": "http://127.0.0.1:8765/callback",
+    \\    "scopes": ["tweet.read", "users.read", "bookmark.read", "offline.access"]
+    \\  },
+    \\  "storage": {
+    \\    "database_path": "~/.local/share/x-bookmarks/x_bookmarks.sqlite",
+    \\    "token_path": "~/.local/share/x-bookmarks/oauth-token.json",
+    \\    "assets_dir": "~/.local/share/x-bookmarks/assets"
+    \\  },
+    \\  "sync": {
+    \\    "max_results": 100,
+    \\    "store_raw_pages": true,
+    \\    "download_media": true,
+    \\    "quote_post_depth": 1,
+    \\    "require_approval": true,
+    \\    "stop_at_first_complete_bookmark": true
+    \\  },
+    \\  "viewer": {
+    \\    "export_dir": "~/.local/share/x-bookmarks/viewer-export"
+    \\  }
+    \\}
+    \\
+;
+
+const HttpResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+    content_type: ?[]const u8 = null,
+    rate_limit_reset: ?i64 = null,
+};
+
+const TokenState = struct {
+    access_token: []const u8,
+    refresh_token: ?[]const u8,
+    token_type: ?[]const u8,
+    scope: ?[]const u8,
+    expires_at: ?i64,
+    account_user_id: ?[]const u8,
+
+    fn deinit(self: TokenState, allocator: std.mem.Allocator) void {
+        allocator.free(self.access_token);
+        if (self.refresh_token) |value| allocator.free(value);
+        if (self.token_type) |value| allocator.free(value);
+        if (self.scope) |value| allocator.free(value);
+        if (self.account_user_id) |value| allocator.free(value);
+    }
+};
+
+const Runtime = struct {
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    config_path_arg: ?[]const u8 = null,
+    home_arg: ?[]const u8 = null,
+    command_index: usize = 1,
+};
+
+const Paths = struct {
+    config_path: []const u8,
+    config_dir: []const u8,
+    state_dir: []const u8,
+};
+
+const Config = struct {
+    client_id: []const u8,
+    client_secret: ?[]const u8,
+    redirect_uri: []const u8,
+    scopes: []const []const u8,
+    database_path: []const u8,
+    token_path: []const u8,
+    assets_dir: []const u8,
+    export_dir: []const u8,
+    max_results: u32,
+    store_raw_pages: bool,
+    download_media: bool,
+    quote_post_depth: u32,
+    require_approval: bool,
+    stop_at_first_complete_bookmark: bool,
+    config_path: []const u8,
+    base_dir: []const u8,
+    home_override: ?[]const u8,
+
+    fn default(allocator: std.mem.Allocator, paths: Paths, home_override: ?[]const u8) !Config {
+        const state_dir = paths.state_dir;
+        return .{
+            .client_id = try allocator.dupe(u8, "your-client-id"),
+            .client_secret = null,
+            .redirect_uri = try allocator.dupe(u8, "http://127.0.0.1:8765/callback"),
+            .scopes = try cloneScopes(allocator, &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" }),
+            .database_path = try std.fs.path.join(allocator, &.{ state_dir, "x_bookmarks.sqlite" }),
+            .token_path = try std.fs.path.join(allocator, &.{ state_dir, "oauth-token.json" }),
+            .assets_dir = try std.fs.path.join(allocator, &.{ state_dir, "assets" }),
+            .export_dir = try std.fs.path.join(allocator, &.{ state_dir, "viewer-export" }),
+            .max_results = 100,
+            .store_raw_pages = true,
+            .download_media = true,
+            .quote_post_depth = 1,
+            .require_approval = true,
+            .stop_at_first_complete_bookmark = true,
+            .config_path = paths.config_path,
+            .base_dir = paths.config_dir,
+            .home_override = if (home_override != null) paths.state_dir else null,
+        };
+    }
+};
+
+const Db = struct {
+    handle: *c.sqlite3,
+
+    fn open(path: []const u8, allocator: std.mem.Allocator) !Db {
+        try ensureParentDir(path);
+        const zpath = try allocator.dupeZ(u8, path);
+        defer allocator.free(zpath);
+        var raw: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open_v2(zpath.ptr, &raw, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null);
+        if (rc != c.SQLITE_OK) return AppError.SqliteError;
+        if (c.sqlite3_busy_timeout(raw.?, 5000) != c.SQLITE_OK) {
+            _ = c.sqlite3_close(raw.?);
+            return AppError.SqliteError;
+        }
+        return .{ .handle = raw.? };
+    }
+
+    fn close(self: *Db) void {
+        _ = c.sqlite3_close(self.handle);
+    }
+
+    fn exec(self: *Db, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.handle, sql.ptr, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            if (err_msg != null) {
+                std.debug.print("sqlite error: {s}\n", .{std.mem.span(err_msg)});
+                c.sqlite3_free(err_msg);
+            }
+            return AppError.SqliteError;
+        }
+    }
+
+    fn prepare(self: *Db, sql: []const u8) !*c.sqlite3_stmt {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) {
+            std.debug.print("sqlite prepare error: {s}\n", .{std.mem.span(c.sqlite3_errmsg(self.handle))});
+            return AppError.SqliteError;
+        }
+        return stmt.?;
+    }
+};
+
+pub fn main() void {
+    run() catch |err| {
+        const writer = std.fs.File.stderr().deprecatedWriter();
+        writer.print("error: {}\n", .{err}) catch {};
+        std.process.exit(exitCode(err));
+    };
+}
+
+fn run() !void {
+    const allocator = std.heap.page_allocator;
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var rt = Runtime{ .allocator = allocator, .args = args };
+    try parseGlobalArgs(&rt);
+
+    if (rt.command_index >= args.len) {
+        try printHelp();
+        return;
+    }
+
+    const cmd = args[rt.command_index];
+    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+        try printHelp();
+    } else if (std.mem.eql(u8, cmd, "config")) {
+        try commandConfig(&rt);
+    } else if (std.mem.eql(u8, cmd, "db")) {
+        try commandDb(&rt);
+    } else if (std.mem.eql(u8, cmd, "auth")) {
+        try commandAuth(&rt);
+    } else if (std.mem.eql(u8, cmd, "sync")) {
+        try commandSync(&rt);
+    } else if (std.mem.eql(u8, cmd, "export")) {
+        try commandExport(&rt);
+    } else if (std.mem.eql(u8, cmd, "viewer")) {
+        try commandViewer(&rt);
+    } else if (std.mem.eql(u8, cmd, "assets")) {
+        try commandAssets(&rt);
+    } else if (std.mem.eql(u8, cmd, "integration")) {
+        try commandIntegration(&rt);
+    } else if (std.mem.eql(u8, cmd, "bookmarks")) {
+        try commandBookmarks(&rt);
+    } else {
+        std.debug.print("unknown command: {s}\n\n", .{cmd});
+        try printHelp();
+        return AppError.InvalidCommand;
+    }
+}
+
+fn exitCode(err: anyerror) u8 {
+    return switch (err) {
+        AppError.InvalidCommand, AppError.InvalidArguments => 2,
+        AppError.MissingHome, AppError.MissingConfig, AppError.ConfigInvalid, AppError.ConfigExists => 3,
+        AppError.AuthRequired => 4,
+        AppError.RateLimited => 5,
+        AppError.HttpError => 6,
+        AppError.SqliteError => 7,
+        else => 1,
+    };
+}
+
+fn parseGlobalArgs(rt: *Runtime) !void {
+    var i: usize = 1;
+    while (i < rt.args.len) : (i += 1) {
+        const arg = rt.args[i];
+        if (!std.mem.startsWith(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            rt.config_path_arg = rt.args[i];
+        } else if (std.mem.eql(u8, arg, "--home")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            rt.home_arg = rt.args[i];
+        } else {
+            break;
+        }
+    }
+    rt.command_index = i;
+}
+
+fn printHelp() !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.writeAll(
+        \\x-bookmarks
+        \\
+        \\Usage:
+        \\  x-bookmarks [--config PATH] [--home PATH] config init [--force] [--client-id VALUE] [--redirect-uri URI]
+        \\  x-bookmarks [--config PATH] [--home PATH] config status
+        \\  x-bookmarks [--config PATH] [--home PATH] db init|status
+        \\  x-bookmarks [--config PATH] [--home PATH] auth login [--code CODE | --callback-url URL]
+        \\  x-bookmarks [--config PATH] [--home PATH] auth status|refresh
+        \\  x-bookmarks [--config PATH] [--home PATH] sync [--full] [--yolo|--yes] [--wait-rate-limit] [--limit-pages N] [--max-results N] [--no-media|--download-media]
+        \\  x-bookmarks [--config PATH] [--home PATH] export --format jsonl
+        \\  x-bookmarks [--config PATH] [--home PATH] viewer export|serve
+        \\  x-bookmarks [--config PATH] [--home PATH] assets verify
+        \\  x-bookmarks [--config PATH] [--home PATH] bookmarks list [--limit N]
+        \\  x-bookmarks [--config PATH] [--home PATH] bookmarks stats
+        \\  x-bookmarks [--config PATH] [--home PATH] integration test --live [--limit-pages N] [--max-results N] [--no-media]
+        \\
+    );
+}
+
+fn commandConfig(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "config");
+    if (std.mem.eql(u8, sub, "init")) {
+        try configInit(rt);
+    } else if (std.mem.eql(u8, sub, "status")) {
+        const paths = try resolvePaths(rt.allocator, rt.config_path_arg, rt.home_arg);
+        const cfg = try loadConfig(rt.allocator, paths, rt.home_arg);
+        try printConfigStatus(rt.allocator, cfg);
+        try validateConfig(cfg);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn configInit(rt: *Runtime) !void {
+    var force = false;
+    var client_id: ?[]const u8 = null;
+    var redirect_uri: ?[]const u8 = null;
+
+    var i = rt.command_index + 2;
+    while (i < rt.args.len) : (i += 1) {
+        const arg = rt.args[i];
+        if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, arg, "--client-id")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            client_id = rt.args[i];
+        } else if (std.mem.eql(u8, arg, "--redirect-uri")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            redirect_uri = rt.args[i];
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+
+    const paths = try resolvePaths(rt.allocator, rt.config_path_arg, rt.home_arg);
+    if (!force and fileExists(paths.config_path)) return AppError.ConfigExists;
+    try ensureParentDir(paths.config_path);
+
+    var text = try rt.allocator.dupe(u8, config_template);
+    defer rt.allocator.free(text);
+    if (client_id) |v| {
+        const json = try jsonStringAlloc(rt.allocator, v);
+        defer rt.allocator.free(json);
+        text = try replaceOwned(rt.allocator, text, "\"your-client-id\"", json);
+    }
+    if (redirect_uri) |v| {
+        const json = try jsonStringAlloc(rt.allocator, v);
+        defer rt.allocator.free(json);
+        text = try replaceOwned(rt.allocator, text, "\"http://127.0.0.1:8765/callback\"", json);
+    }
+    if (rt.home_arg != null) {
+        text = try replaceOwned(rt.allocator, text, "~/.local/share/x-bookmarks/x_bookmarks.sqlite", "x_bookmarks.sqlite");
+        text = try replaceOwned(rt.allocator, text, "~/.local/share/x-bookmarks/oauth-token.json", "oauth-token.json");
+        text = try replaceOwned(rt.allocator, text, "~/.local/share/x-bookmarks/assets", "assets");
+        text = try replaceOwned(rt.allocator, text, "~/.local/share/x-bookmarks/viewer-export", "viewer-export");
+    } else if (try envVarPresent(rt.allocator, "XDG_DATA_HOME")) {
+        text = try replaceTemplateStatePaths(rt.allocator, text, paths.state_dir);
+    }
+
+    try std.fs.cwd().writeFile(.{ .sub_path = paths.config_path, .data = text });
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("created config: {s}\n", .{paths.config_path});
+}
+
+fn commandDb(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "db");
+    const cfg = try loadRuntimeConfig(rt);
+    if (std.mem.eql(u8, sub, "init")) {
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        try std.fs.cwd().makePath(cfg.assets_dir);
+        try std.fs.cwd().makePath(cfg.export_dir);
+        try std.fs.File.stdout().deprecatedWriter().print("initialized database: {s}\n", .{cfg.database_path});
+    } else if (std.mem.eql(u8, sub, "status")) {
+        try dbStatus(rt.allocator, cfg);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn commandAuth(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "auth");
+    const cfg = try loadRuntimeConfig(rt);
+    if (std.mem.eql(u8, sub, "status")) {
+        try authStatus(rt.allocator, cfg);
+    } else if (std.mem.eql(u8, sub, "login")) {
+        var code: ?[]const u8 = null;
+        var callback_state: ?[]const u8 = null;
+        var owned_code: ?[]const u8 = null;
+        defer if (owned_code) |value| rt.allocator.free(value);
+        var owned_callback_state: ?[]const u8 = null;
+        defer if (owned_callback_state) |value| rt.allocator.free(value);
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--code")) {
+                if (code != null) return AppError.InvalidArguments;
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                code = rt.args[i];
+            } else if (std.mem.eql(u8, rt.args[i], "--callback-url")) {
+                if (code != null) return AppError.InvalidArguments;
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                owned_code = try callbackParamFromUrl(rt.allocator, rt.args[i], "code");
+                owned_callback_state = try callbackParamFromUrl(rt.allocator, rt.args[i], "state");
+                code = owned_code.?;
+                callback_state = owned_callback_state.?;
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (code) |value| try authLoginExchange(rt.allocator, cfg, value, callback_state) else try authLoginStart(rt.allocator, cfg);
+    } else if (std.mem.eql(u8, sub, "refresh")) {
+        var token = try loadToken(rt.allocator, cfg.token_path);
+        defer token.deinit(rt.allocator);
+        const refreshed = try refreshToken(rt.allocator, cfg, token);
+        token.deinit(rt.allocator);
+        token = refreshed;
+        if (token.account_user_id) |account_user_id| {
+            if (account_user_id.len > 0) {
+                var db = try Db.open(cfg.database_path, rt.allocator);
+                defer db.close();
+                try applyMigrations(&db);
+                try upsertTokenObservationFromState(&db, rt.allocator, cfg, account_user_id, token);
+            }
+        }
+        try std.fs.File.stdout().deprecatedWriter().print("refreshed token for account: {s}\n", .{token.account_user_id orelse "unknown"});
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn authStatus(allocator: std.mem.Allocator, cfg: Config) !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("token path: {s}\n", .{cfg.token_path});
+    if (!fileExists(cfg.token_path)) {
+        try out.writeAll("token: missing\n");
+        return;
+    }
+    const token = try std.fs.cwd().readFileAlloc(allocator, cfg.token_path, 1024 * 1024);
+    defer allocator.free(token);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, token, .{});
+    defer parsed.deinit();
+    if (std.mem.eql(u8, getString(parsed.value, "status") orelse "", "pending")) {
+        try out.writeAll("token: pending OAuth login\naccess token: missing\nrefresh token: missing\naccount: unknown\nexpires_at: unknown\n");
+        if (getString(parsed.value, "redirect_uri")) |redirect_uri| {
+            try out.print("redirect uri: {s}\n", .{redirect_uri});
+        }
+        return;
+    }
+    const access = getString(parsed.value, "access_token");
+    const refresh = getString(parsed.value, "refresh_token");
+    const account = getString(parsed.value, "account_user_id") orelse "unknown";
+    const expires_at = getInt(parsed.value, "expires_at");
+    try out.print("token: present\naccess token: {s}\nrefresh token: {s}\n", .{
+        if (access != null and access.?.len > 0) "present" else "missing",
+        if (refresh != null and refresh.?.len > 0) "present" else "missing",
+    });
+    const expires_text = if (expires_at) |value| try std.fmt.allocPrint(allocator, "{}", .{value}) else "unknown";
+    defer if (expires_at != null) allocator.free(expires_text);
+    try out.print("account: {s}\nexpires_at: {s}\n", .{ account, expires_text });
+}
+
+fn authLoginStart(allocator: std.mem.Allocator, cfg: Config) !void {
+    if (std.mem.eql(u8, cfg.client_id, "your-client-id") or cfg.client_id.len == 0) {
+        std.debug.print("config is missing x.client_id\n", .{});
+        return AppError.ConfigInvalid;
+    }
+    const verifier = try makePkceVerifier(allocator);
+    defer allocator.free(verifier);
+    const challenge = try makePkceChallenge(allocator, verifier);
+    defer allocator.free(challenge);
+    const state = try makePkceVerifier(allocator);
+    defer allocator.free(state);
+    const scope_joined = try joinScopes(allocator, cfg.scopes, " ");
+    defer allocator.free(scope_joined);
+    const auth_url = try buildAuthUrl(allocator, cfg.client_id, cfg.redirect_uri, scope_joined, state, challenge);
+    defer allocator.free(auth_url);
+
+    try ensureParentDir(cfg.token_path);
+    const created = try timestampString(allocator);
+    defer allocator.free(created);
+    const pending = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"status\": \"pending\",\n  \"authorization_url\": {f},\n  \"redirect_uri\": {f},\n  \"scopes\": {f},\n  \"pkce_verifier\": {f},\n  \"state\": {f},\n  \"created_at\": {f}\n}}\n",
+        .{
+            std.json.fmt(auth_url, .{}),
+            std.json.fmt(cfg.redirect_uri, .{}),
+            std.json.fmt(scope_joined, .{}),
+            std.json.fmt(verifier, .{}),
+            std.json.fmt(state, .{}),
+            std.json.fmt(created, .{}),
+        },
+    );
+    defer allocator.free(pending);
+    try writePrivateFile(cfg.token_path, pending);
+
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.writeAll("Open this authorization URL in a browser, then exchange the returned code with X OAuth 2.0.\n");
+    try out.print("{s}\n\n", .{auth_url});
+    try out.print("pending PKCE state written to: {s}\n", .{cfg.token_path});
+}
+
+fn authLoginExchange(allocator: std.mem.Allocator, cfg: Config, code: []const u8, callback_state: ?[]const u8) !void {
+    const pending_text = try std.fs.cwd().readFileAlloc(allocator, cfg.token_path, 1024 * 1024);
+    defer allocator.free(pending_text);
+    var pending = try std.json.parseFromSlice(std.json.Value, allocator, pending_text, .{});
+    defer pending.deinit();
+    const verifier = getString(pending.value, "pkce_verifier") orelse {
+        std.debug.print("token file does not contain pending pkce_verifier; run auth login first\n", .{});
+        return AppError.AuthRequired;
+    };
+    if (callback_state) |actual_state| {
+        try validateCallbackState(pending.value, actual_state);
+    }
+
+    const payload = if (cfg.client_secret != null) try oauthPayload(allocator, &.{
+        .{ "grant_type", "authorization_code" },
+        .{ "redirect_uri", cfg.redirect_uri },
+        .{ "code_verifier", verifier },
+        .{ "code", code },
+    }) else try oauthPayload(allocator, &.{
+        .{ "grant_type", "authorization_code" },
+        .{ "client_id", cfg.client_id },
+        .{ "redirect_uri", cfg.redirect_uri },
+        .{ "code_verifier", verifier },
+        .{ "code", code },
+    });
+    defer allocator.free(payload);
+
+    const basic_auth = try oauthBasicAuthHeader(allocator, cfg.client_id, cfg.client_secret);
+    defer if (basic_auth) |value| allocator.free(value);
+    var headers_buf = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+        .{ .name = "Accept", .value = "application/json" },
+        .{ .name = "Authorization", .value = "" },
+    };
+    var header_count: usize = 2;
+    if (basic_auth) |value| {
+        headers_buf[2] = .{ .name = "Authorization", .value = value };
+        header_count = 3;
+    }
+    const response = try httpFetch(allocator, .POST, "https://api.x.com/2/oauth2/token", payload, headers_buf[0..header_count]);
+    defer freeHttpResponse(allocator, response);
+    if (response.status != .ok) {
+        std.debug.print("token exchange failed with HTTP {}\n", .{@intFromEnum(response.status)});
+        return AppError.AuthRequired;
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const access = getString(parsed.value, "access_token") orelse return AppError.AuthRequired;
+    const refresh = getString(parsed.value, "refresh_token");
+    const expires_in = getInt(parsed.value, "expires_in") orelse 0;
+    const token_type = getString(parsed.value, "token_type") orelse "bearer";
+    const scope = getString(parsed.value, "scope") orelse default_scopes;
+    const expires_at = if (expires_in > 0) std.time.timestamp() + expires_in else 0;
+
+    const account = try fetchMe(allocator, access);
+    defer account.deinit(allocator);
+    var db = try Db.open(cfg.database_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try upsertAccount(&db, allocator, account.user_id, account.username, account.name, account.raw_json);
+    try upsertTokenObservation(&db, allocator, account.user_id, token_type, scope, expires_at, cfg.token_path);
+
+    const refresh_json = if (refresh) |r| try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(r, .{})}) else try allocator.dupe(u8, "null");
+    defer allocator.free(refresh_json);
+    const updated = try timestampString(allocator);
+    defer allocator.free(updated);
+    const token_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"access_token\": {f},\n  \"refresh_token\": {s},\n  \"token_type\": {f},\n  \"scope\": {f},\n  \"expires_at\": {},\n  \"account_user_id\": {f},\n  \"updated_at\": \"{s}\"\n}}\n",
+        .{
+            std.json.fmt(access, .{}),
+            refresh_json,
+            std.json.fmt(token_type, .{}),
+            std.json.fmt(scope, .{}),
+            expires_at,
+            std.json.fmt(account.user_id, .{}),
+            updated,
+        },
+    );
+    defer allocator.free(token_json);
+    try writePrivateFile(cfg.token_path, token_json);
+    try std.fs.File.stdout().deprecatedWriter().print("authenticated account: @{s} ({s})\n", .{ account.username, account.user_id });
+}
+
+fn commandSync(rt: *Runtime) !void {
+    var full = false;
+    var yolo = false;
+    var wait_rate_limit = false;
+    var limit_pages: ?u32 = null;
+    var max_results_override: ?u32 = null;
+    var download_media_override: ?bool = null;
+    var i = rt.command_index + 1;
+    while (i < rt.args.len) : (i += 1) {
+        const arg = rt.args[i];
+        if (std.mem.eql(u8, arg, "--full")) {
+            full = true;
+        } else if (std.mem.eql(u8, arg, "--yolo") or std.mem.eql(u8, arg, "--yes")) {
+            yolo = true;
+        } else if (std.mem.eql(u8, arg, "--wait-rate-limit")) {
+            wait_rate_limit = true;
+        } else if (std.mem.eql(u8, arg, "--limit-pages")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            limit_pages = try parseU32Arg(rt.args[i]);
+            if (limit_pages.? == 0) return AppError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-results")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            max_results_override = try parseU32Arg(rt.args[i]);
+        } else if (std.mem.eql(u8, arg, "--no-media")) {
+            download_media_override = false;
+        } else if (std.mem.eql(u8, arg, "--download-media")) {
+            download_media_override = true;
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+
+    var cfg = try loadRuntimeConfig(rt);
+    try applySyncCliOverrides(&cfg, max_results_override, download_media_override);
+    try validateConfig(cfg);
+    if (!fileExists(cfg.token_path)) {
+        std.debug.print("missing OAuth token file: {s}\n", .{cfg.token_path});
+        return AppError.AuthRequired;
+    }
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    var token = try loadToken(rt.allocator, cfg.token_path);
+    defer token.deinit(rt.allocator);
+    try refreshTokenIfNeeded(rt.allocator, cfg, &token);
+    var discovered_account_user_id: ?[]const u8 = null;
+    defer if (discovered_account_user_id) |value| rt.allocator.free(value);
+    const account_user_id = nonEmptyOptional(token.account_user_id) orelse blk: {
+        const me = try fetchMe(rt.allocator, token.access_token);
+        defer me.deinit(rt.allocator);
+        try upsertAccount(&db, rt.allocator, me.user_id, me.username, me.name, me.raw_json);
+        discovered_account_user_id = try rt.allocator.dupe(u8, me.user_id);
+        break :blk discovered_account_user_id.?;
+    };
+    try upsertTokenObservationFromState(&db, rt.allocator, cfg, account_user_id, token);
+
+    if (cfg.require_approval and !yolo) {
+        const discovery = try discoverSyncWork(&db, rt.allocator, cfg, token.access_token, account_user_id, full, limit_pages, wait_rate_limit);
+        try std.fs.File.stdout().deprecatedWriter().print(
+            "Found {} new bookmarks and up to {} media assets across {} page(s). Download and write now? [y/N] ",
+            .{ discovery.new_bookmarks, discovery.media_assets, discovery.pages },
+        );
+        var answer_buf: [8]u8 = undefined;
+        const n = try std.fs.File.stdin().read(&answer_buf);
+        const answer = std.mem.trim(u8, answer_buf[0..n], " \t\r\n");
+        if (!(std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes"))) {
+            try std.fs.File.stdout().deprecatedWriter().writeAll("sync cancelled\n");
+            return;
+        }
+    }
+
+    const request_json = try syncRequestJson(rt.allocator, cfg, full, yolo, limit_pages);
+    defer rt.allocator.free(request_json);
+    const run_id = try createSyncRun(&db, account_user_id, if (full) "full" else "incremental", request_json, rt.allocator);
+    var retried_auth = false;
+    const result = while (true) {
+        break runBookmarkSync(&db, rt.allocator, cfg, token.access_token, account_user_id, run_id, full, limit_pages, wait_rate_limit) catch |err| {
+            if (err == AppError.AuthRequired and !retried_auth and token.refresh_token != null) {
+                const refreshed = try refreshToken(rt.allocator, cfg, token);
+                token.deinit(rt.allocator);
+                token = refreshed;
+                retried_auth = true;
+                continue;
+            }
+            const e = try std.fmt.allocPrint(rt.allocator, "{{\"error\":\"{}\"}}", .{err});
+            defer rt.allocator.free(e);
+            try markRunBookmarksIncomplete(&db, account_user_id, run_id);
+            try finishSyncRun(&db, run_id, "failed", 0, 0, 0, false, null, e, rt.allocator);
+            return err;
+        };
+    };
+    defer if (result.early_stop_tweet_id) |value| rt.allocator.free(value);
+    if (shouldDeactivateMissingAfterSync(full, limit_pages)) {
+        try markBookmarksInactiveNotSeen(&db, account_user_id, run_id);
+    } else if (full and limit_pages != null) {
+        try recordSyncWarning(&db, rt.allocator, run_id, "full_sync_limited_no_deactivation", "{\"reason\":\"limit_pages\"}");
+    }
+    try refreshBookmarkCompletenessForRun(&db, rt.allocator, account_user_id, run_id, result.folder_state_accounted);
+    try finishSyncRun(&db, run_id, "succeeded", result.pages, result.tweets, result.new_bookmarks, result.early_stop_used, result.early_stop_tweet_id, null, rt.allocator);
+    if (result.ordering_warning) {
+        try std.fs.File.stderr().deprecatedWriter().writeAll("warning: bookmark ordering shifted unexpectedly; consider `x-bookmarks sync --full`\n");
+    }
+    if (result.cap_warning) {
+        try std.fs.File.stderr().deprecatedWriter().writeAll("warning: API returned at least 800 bookmarks and no next page; results may be capped by X API access behavior\n");
+    }
+    try std.fs.File.stdout().deprecatedWriter().print("sync succeeded: pages={} tweets={} new_bookmarks={} early_stop={}\n", .{ result.pages, result.tweets, result.new_bookmarks, result.early_stop_used });
+}
+
+fn commandExport(rt: *Runtime) !void {
+    var format: []const u8 = "jsonl";
+    var i = rt.command_index + 1;
+    while (i < rt.args.len) : (i += 1) {
+        if (std.mem.eql(u8, rt.args[i], "--format")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            format = rt.args[i];
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+    if (!std.mem.eql(u8, format, "jsonl")) return AppError.InvalidArguments;
+    const cfg = try loadRuntimeConfig(rt);
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try validateCompleteBookmarksForExport(&db, rt.allocator);
+    try exportJsonl(&db, rt.allocator, std.fs.File.stdout().deprecatedWriter());
+}
+
+fn commandViewer(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "viewer");
+    const cfg = try loadRuntimeConfig(rt);
+    if (std.mem.eql(u8, sub, "export")) {
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        try viewerExport(&db, rt.allocator, cfg);
+    } else if (std.mem.eql(u8, sub, "serve")) {
+        try validateViewerExportFiles(rt.allocator, cfg.export_dir);
+        try serveDirectory(rt.allocator, cfg.export_dir, 8766);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn commandAssets(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "assets");
+    if (!std.mem.eql(u8, sub, "verify")) return AppError.InvalidCommand;
+    const cfg = try loadRuntimeConfig(rt);
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try assetsVerify(&db, rt.allocator);
+}
+
+fn commandIntegration(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "integration");
+    if (!std.mem.eql(u8, sub, "test")) return AppError.InvalidCommand;
+
+    var live = false;
+    var limit_pages: u32 = 1;
+    var max_results: ?u32 = 1;
+    var download_media: ?bool = null;
+    var i = rt.command_index + 2;
+    while (i < rt.args.len) : (i += 1) {
+        if (std.mem.eql(u8, rt.args[i], "--live")) {
+            live = true;
+        } else if (std.mem.eql(u8, rt.args[i], "--limit-pages")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            limit_pages = try parseU32Arg(rt.args[i]);
+            if (limit_pages == 0) return AppError.InvalidArguments;
+        } else if (std.mem.eql(u8, rt.args[i], "--max-results")) {
+            i += 1;
+            if (i >= rt.args.len) return AppError.InvalidArguments;
+            max_results = try parseU32Arg(rt.args[i]);
+        } else if (std.mem.eql(u8, rt.args[i], "--no-media")) {
+            download_media = false;
+        } else {
+            return AppError.InvalidArguments;
+        }
+    }
+
+    if (!live) {
+        try std.fs.File.stdout().deprecatedWriter().writeAll("integration test skipped: pass --live to use real X API credentials\n");
+        return;
+    }
+
+    const cfg = try loadRuntimeConfig(rt);
+    try validateConfig(cfg);
+    var token = try loadToken(rt.allocator, cfg.token_path);
+    defer token.deinit(rt.allocator);
+    try refreshTokenIfNeeded(rt.allocator, cfg, &token);
+    const account = try fetchMe(rt.allocator, token.access_token);
+    defer account.deinit(rt.allocator);
+
+    const integration_name = try uniqueRunDirectoryName(rt.allocator, "live");
+    defer rt.allocator.free(integration_name);
+    const integration_dir = try std.fs.path.join(rt.allocator, &.{ ".zig-cache", "integration", integration_name });
+    defer rt.allocator.free(integration_dir);
+    try std.fs.cwd().makePath(integration_dir);
+
+    var test_cfg = cfg;
+    test_cfg.database_path = try std.fs.path.join(rt.allocator, &.{ integration_dir, "x_bookmarks.sqlite" });
+    defer rt.allocator.free(test_cfg.database_path);
+    test_cfg.assets_dir = try std.fs.path.join(rt.allocator, &.{ integration_dir, "assets" });
+    defer rt.allocator.free(test_cfg.assets_dir);
+    test_cfg.export_dir = try std.fs.path.join(rt.allocator, &.{ integration_dir, "viewer-export" });
+    defer rt.allocator.free(test_cfg.export_dir);
+    test_cfg.require_approval = false;
+    try applySyncCliOverrides(&test_cfg, max_results, download_media);
+
+    var db = try Db.open(test_cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try upsertAccount(&db, rt.allocator, account.user_id, account.username, account.name, account.raw_json);
+
+    const request_json = try syncRequestJson(rt.allocator, test_cfg, false, true, limit_pages);
+    defer rt.allocator.free(request_json);
+    const run_id = try createSyncRun(&db, account.user_id, "integration", request_json, rt.allocator);
+    const result = try runBookmarkSync(&db, rt.allocator, test_cfg, token.access_token, account.user_id, run_id, false, limit_pages, false);
+    defer if (result.early_stop_tweet_id) |value| rt.allocator.free(value);
+    try refreshBookmarkCompletenessForRun(&db, rt.allocator, account.user_id, run_id, result.folder_state_accounted);
+    try finishSyncRun(&db, run_id, "succeeded", result.pages, result.tweets, result.new_bookmarks, result.early_stop_used, result.early_stop_tweet_id, null, rt.allocator);
+    try viewerExport(&db, rt.allocator, test_cfg);
+    try validateViewerExportFiles(rt.allocator, test_cfg.export_dir);
+    try assetsVerify(&db, rt.allocator);
+
+    try std.fs.File.stdout().deprecatedWriter().print(
+        "integration test passed: account=@{s} pages={} tweets={} db={s} viewer={s}\n",
+        .{ account.username, result.pages, result.tweets, test_cfg.database_path, test_cfg.export_dir },
+    );
+}
+
+fn validateViewerExportFiles(allocator: std.mem.Allocator, export_dir: []const u8) !void {
+    const required = [_][]const u8{
+        "index.html",
+        "data/bookmarks.json",
+        "data/tweets.json",
+        "data/folders.json",
+        "data/folder-items.json",
+        "data/media-assets.json",
+        "data/tweet-media.json",
+        "data/missing-references.json",
+        "data/sync-warnings.json",
+        "data/sync-summary.json",
+    };
+    for (required) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ export_dir, rel });
+        defer allocator.free(path);
+        if (!fileExists(path)) {
+            if (!builtin.is_test) std.debug.print("viewer export missing required file: {s}\n", .{path});
+            return AppError.IoError;
+        }
+    }
+    try validateViewerAssetReferences(allocator, export_dir);
+}
+
+fn validateViewerAssetReferences(allocator: std.mem.Allocator, export_dir: []const u8) !void {
+    const index_path = try std.fs.path.join(allocator, &.{ export_dir, "index.html" });
+    defer allocator.free(index_path);
+    const index = try std.fs.cwd().readFileAlloc(allocator, index_path, 1024 * 1024);
+    defer allocator.free(index);
+
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, index, offset, "assets/")) |start| {
+        var end = start;
+        while (end < index.len and !isAssetRefTerminator(index[end])) : (end += 1) {}
+        if (end > start) {
+            const rel = index[start..end];
+            const path = try std.fs.path.join(allocator, &.{ export_dir, rel });
+            defer allocator.free(path);
+            if (!fileExists(path)) {
+                if (!builtin.is_test) std.debug.print("viewer export missing referenced asset: {s}\n", .{path});
+                return AppError.IoError;
+            }
+        }
+        offset = end;
+    }
+}
+
+fn isAssetRefTerminator(ch: u8) bool {
+    return ch == '"' or ch == '\'' or ch == '<' or ch == '>' or ch == ')' or std.ascii.isWhitespace(ch);
+}
+
+fn commandBookmarks(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "bookmarks");
+    const cfg = try loadRuntimeConfig(rt);
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    if (std.mem.eql(u8, sub, "stats")) {
+        try printBookmarkStats(&db);
+    } else if (std.mem.eql(u8, sub, "list")) {
+        var limit: u32 = 50;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--limit")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                limit = try parseU32Arg(rt.args[i]);
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        try listBookmarks(&db, limit);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn printBookmarkStats(db: *Db) !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("bookmarks: {}\n", .{try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1")});
+    try out.print("complete: {}\n", .{try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1 AND complete_for_offline_render = 1")});
+    try out.print("incomplete: {}\n", .{try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1 AND complete_for_offline_render = 0")});
+    try out.print("tweets: {}\n", .{try scalarCount(db, "SELECT count(*) FROM tweets")});
+    try out.print("media assets: {}\n", .{try scalarCount(db, "SELECT count(*) FROM media_assets")});
+    try out.print("folders: {}\n", .{try scalarCount(db, "SELECT count(*) FROM bookmark_folders")});
+    try out.print("missing references: {}\n", .{try scalarCount(db, "SELECT count(*) FROM missing_references")});
+}
+
+fn listBookmarks(db: *Db, limit: u32) !void {
+    const stmt = try db.prepare(
+        \\SELECT b.tweet_id, b.complete_for_offline_render, coalesce(u.username, ''), coalesce(t.text, ''), t.canonical_uri
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+        \\LIMIT ?
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int(stmt, 1, @intCast(limit));
+    const out = std.fs.File.stdout().deprecatedWriter();
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const text = colText(stmt, 3);
+        const preview = if (text.len > 100) text[0..100] else text;
+        try out.print("{s}\t{s}\t@{s}\t{s}\t{s}\n", .{
+            colText(stmt, 0),
+            if (c.sqlite3_column_int(stmt, 1) != 0) "complete" else "incomplete",
+            colText(stmt, 2),
+            preview,
+            colText(stmt, 4),
+        });
+    }
+}
+
+fn shouldDeactivateMissingAfterSync(full: bool, limit_pages: ?u32) bool {
+    return full and limit_pages == null;
+}
+
+fn requiredSubcommand(rt: *Runtime, parent: []const u8) ![]const u8 {
+    _ = parent;
+    const idx = rt.command_index + 1;
+    if (idx >= rt.args.len) return AppError.InvalidCommand;
+    return rt.args[idx];
+}
+
+fn parseU32Arg(value: []const u8) !u32 {
+    return std.fmt.parseInt(u32, value, 10) catch AppError.InvalidArguments;
+}
+
+fn resolvePaths(allocator: std.mem.Allocator, explicit_config: ?[]const u8, home_override: ?[]const u8) !Paths {
+    if (home_override) |h| {
+        const home_abs = try absolutize(allocator, h);
+        const config_path = if (explicit_config) |p| try absolutize(allocator, p) else try std.fs.path.join(allocator, &.{ home_abs, "config.json" });
+        return .{
+            .config_path = config_path,
+            .config_dir = try dirnameDup(allocator, config_path),
+            .state_dir = home_abs,
+        };
+    }
+
+    const config_base = std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => try homeRelativePath(allocator, ".config"),
+        else => return err,
+    };
+    defer allocator.free(config_base);
+    const data_base = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => try homeRelativePath(allocator, ".local/share"),
+        else => return err,
+    };
+    defer allocator.free(data_base);
+
+    const config_path = if (explicit_config) |p| try absolutize(allocator, p) else try std.fs.path.join(allocator, &.{ config_base, "x-bookmarks", "config.json" });
+    return .{
+        .config_path = config_path,
+        .config_dir = try dirnameDup(allocator, config_path),
+        .state_dir = try std.fs.path.join(allocator, &.{ data_base, "x-bookmarks" }),
+    };
+}
+
+fn homeRelativePath(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 {
+    const home = try getHome(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, suffix });
+}
+
+fn loadRuntimeConfig(rt: *Runtime) !Config {
+    const paths = try resolvePaths(rt.allocator, rt.config_path_arg, rt.home_arg);
+    if (!fileExists(paths.config_path)) {
+        std.debug.print("missing config: {s}\nrun `x-bookmarks config init` first\n", .{paths.config_path});
+        return AppError.MissingConfig;
+    }
+    return loadConfig(rt.allocator, paths, rt.home_arg);
+}
+
+fn loadConfig(allocator: std.mem.Allocator, paths: Paths, home_override: ?[]const u8) !Config {
+    var cfg = try Config.default(allocator, paths, home_override);
+    if (!fileExists(paths.config_path)) return cfg;
+
+    const text = try std.fs.cwd().readFileAlloc(allocator, paths.config_path, 4 * 1024 * 1024);
+    defer allocator.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return AppError.ConfigInvalid;
+
+    if (getObject(root, "x")) |x| {
+        if (getString(x, "client_id")) |v| cfg.client_id = try allocator.dupe(u8, v);
+        if (getNullableString(x, "client_secret")) |v| cfg.client_secret = if (v) |s| try allocator.dupe(u8, s) else null;
+        if (getString(x, "redirect_uri")) |v| cfg.redirect_uri = try allocator.dupe(u8, v);
+        if (getArray(x, "scopes")) |arr| cfg.scopes = try parseScopes(allocator, arr);
+    }
+    if (getObject(root, "storage")) |storage| {
+        if (getString(storage, "database_path")) |v| cfg.database_path = try resolveConfiguredPath(allocator, cfg, v);
+        if (getString(storage, "token_path")) |v| cfg.token_path = try resolveConfiguredPath(allocator, cfg, v);
+        if (getString(storage, "assets_dir")) |v| cfg.assets_dir = try resolveConfiguredPath(allocator, cfg, v);
+    }
+    if (getObject(root, "viewer")) |viewer| {
+        if (getString(viewer, "export_dir")) |v| cfg.export_dir = try resolveConfiguredPath(allocator, cfg, v);
+    }
+    if (getObject(root, "sync")) |sync| {
+        if (getInt(sync, "max_results")) |v| cfg.max_results = try parseConfigU32(v);
+        if (getBool(sync, "store_raw_pages")) |v| cfg.store_raw_pages = v;
+        if (getBool(sync, "download_media")) |v| cfg.download_media = v;
+        if (getInt(sync, "quote_post_depth")) |v| cfg.quote_post_depth = try parseConfigU32(v);
+        if (getBool(sync, "require_approval")) |v| cfg.require_approval = v;
+        if (getBool(sync, "stop_at_first_complete_bookmark")) |v| cfg.stop_at_first_complete_bookmark = v;
+    }
+    return cfg;
+}
+
+fn parseConfigU32(value: i64) !u32 {
+    if (value < 0 or value > std.math.maxInt(u32)) return AppError.ConfigInvalid;
+    return @intCast(value);
+}
+
+fn envVarPresent(allocator: std.mem.Allocator, name: []const u8) !bool {
+    const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return false,
+        else => return err,
+    };
+    allocator.free(value);
+    return true;
+}
+
+fn replaceTemplateStatePaths(allocator: std.mem.Allocator, text: []u8, state_dir: []const u8) ![]u8 {
+    var out = text;
+    const db_path = try std.fs.path.join(allocator, &.{ state_dir, "x_bookmarks.sqlite" });
+    defer allocator.free(db_path);
+    const token_path = try std.fs.path.join(allocator, &.{ state_dir, "oauth-token.json" });
+    defer allocator.free(token_path);
+    const assets_dir = try std.fs.path.join(allocator, &.{ state_dir, "assets" });
+    defer allocator.free(assets_dir);
+    const export_dir = try std.fs.path.join(allocator, &.{ state_dir, "viewer-export" });
+    defer allocator.free(export_dir);
+
+    out = try replaceJsonStringLiteral(allocator, out, "~/.local/share/x-bookmarks/x_bookmarks.sqlite", db_path);
+    out = try replaceJsonStringLiteral(allocator, out, "~/.local/share/x-bookmarks/oauth-token.json", token_path);
+    out = try replaceJsonStringLiteral(allocator, out, "~/.local/share/x-bookmarks/assets", assets_dir);
+    out = try replaceJsonStringLiteral(allocator, out, "~/.local/share/x-bookmarks/viewer-export", export_dir);
+    return out;
+}
+
+fn replaceJsonStringLiteral(allocator: std.mem.Allocator, original: []u8, needle_raw: []const u8, replacement_raw: []const u8) ![]u8 {
+    const needle = try jsonStringAlloc(allocator, needle_raw);
+    defer allocator.free(needle);
+    const replacement = try jsonStringAlloc(allocator, replacement_raw);
+    defer allocator.free(replacement);
+    return replaceOwned(allocator, original, needle, replacement);
+}
+
+fn applySyncCliOverrides(cfg: *Config, max_results: ?u32, download_media: ?bool) !void {
+    if (max_results) |value| {
+        if (value < 1 or value > 100) return AppError.InvalidArguments;
+        cfg.max_results = value;
+    }
+    if (download_media) |value| cfg.download_media = value;
+}
+
+fn resolveConfiguredPath(allocator: std.mem.Allocator, cfg: Config, p: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, p, "~/")) {
+        const home = try getHome(allocator);
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, p[2..] });
+    }
+    if (std.fs.path.isAbsolute(p)) return allocator.dupe(u8, p);
+    if (cfg.home_override) |h| return std.fs.path.join(allocator, &.{ h, p });
+    return std.fs.path.join(allocator, &.{ cfg.base_dir, p });
+}
+
+fn printConfigStatus(allocator: std.mem.Allocator, cfg: Config) !void {
+    const scopes = try joinScopes(allocator, cfg.scopes, " ");
+    defer allocator.free(scopes);
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print(
+        \\config path: {s}
+        \\database path: {s}
+        \\token path: {s}
+        \\assets dir: {s}
+        \\viewer export dir: {s}
+        \\redirect uri: {s}
+        \\scopes: {s}
+        \\client id: {s}
+        \\token file: {s}
+        \\max results: {}
+        \\download media: {}
+        \\require approval: {}
+        \\stop at first complete bookmark: {}
+        \\
+    , .{
+        cfg.config_path,
+        cfg.database_path,
+        cfg.token_path,
+        cfg.assets_dir,
+        cfg.export_dir,
+        cfg.redirect_uri,
+        scopes,
+        if (cfg.client_id.len > 0 and !std.mem.eql(u8, cfg.client_id, "your-client-id")) "configured" else "missing",
+        if (fileExists(cfg.token_path)) "present" else "missing",
+        cfg.max_results,
+        cfg.download_media,
+        cfg.require_approval,
+        cfg.stop_at_first_complete_bookmark,
+    });
+}
+
+fn validateConfig(cfg: Config) !void {
+    var valid = true;
+    if (cfg.client_id.len == 0 or std.mem.eql(u8, cfg.client_id, "your-client-id")) {
+        try configError("config error: x.client_id is required\n");
+        valid = false;
+    }
+    if (cfg.redirect_uri.len == 0) {
+        try configError("config error: x.redirect_uri is required\n");
+        valid = false;
+    }
+    if (!hasScope(cfg.scopes, "tweet.read") or !hasScope(cfg.scopes, "users.read") or !hasScope(cfg.scopes, "bookmark.read") or !hasScope(cfg.scopes, "offline.access")) {
+        try configError("config error: scopes must include tweet.read, users.read, bookmark.read, and offline.access\n");
+        valid = false;
+    }
+    if (cfg.max_results < 1 or cfg.max_results > 100) {
+        try configError("config error: sync.max_results must be between 1 and 100\n");
+        valid = false;
+    }
+    if (cfg.quote_post_depth != 1) {
+        try configError("config error: sync.quote_post_depth must be 1 in this version\n");
+        valid = false;
+    }
+    if (cfg.database_path.len == 0 or cfg.token_path.len == 0 or cfg.assets_dir.len == 0 or cfg.export_dir.len == 0) {
+        try configError("config error: storage and viewer paths must be non-empty\n");
+        valid = false;
+    }
+    if (!valid) return AppError.ConfigInvalid;
+}
+
+fn configError(message: []const u8) !void {
+    if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().writeAll(message);
+}
+
+fn hasScope(scopes: []const []const u8, needle: []const u8) bool {
+    for (scopes) |scope| {
+        if (std.mem.eql(u8, scope, needle)) return true;
+    }
+    return false;
+}
+
+fn applyMigrations(db: *Db) !void {
+    try db.exec(
+        \\PRAGMA journal_mode=WAL;
+        \\PRAGMA foreign_keys=ON;
+        \\CREATE TABLE IF NOT EXISTS schema_migrations (
+        \\  version TEXT PRIMARY KEY,
+        \\  applied_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS accounts (
+        \\  user_id TEXT PRIMARY KEY,
+        \\  username TEXT,
+        \\  name TEXT,
+        \\  raw_json TEXT NOT NULL,
+        \\  created_at TEXT,
+        \\  updated_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS oauth_token_observations (
+        \\  account_user_id TEXT PRIMARY KEY,
+        \\  token_type TEXT,
+        \\  scope TEXT,
+        \\  expires_at TEXT,
+        \\  token_file_path TEXT,
+        \\  created_at TEXT NOT NULL,
+        \\  updated_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS sync_runs (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  account_user_id TEXT NOT NULL,
+        \\  mode TEXT NOT NULL,
+        \\  status TEXT NOT NULL,
+        \\  started_at TEXT NOT NULL,
+        \\  finished_at TEXT,
+        \\  request_params_json TEXT NOT NULL,
+        \\  pages_requested INTEGER NOT NULL DEFAULT 0,
+        \\  tweets_seen INTEGER NOT NULL DEFAULT 0,
+        \\  new_bookmarks INTEGER NOT NULL DEFAULT 0,
+        \\  early_stop_used INTEGER NOT NULL DEFAULT 0,
+        \\  early_stop_tweet_id TEXT,
+        \\  error_json TEXT
+        \\);
+        \\CREATE TABLE IF NOT EXISTS tweets (
+        \\  tweet_id TEXT PRIMARY KEY,
+        \\  author_id TEXT,
+        \\  conversation_id TEXT,
+        \\  canonical_uri TEXT NOT NULL,
+        \\  twitter_uri TEXT NOT NULL,
+        \\  created_at TEXT,
+        \\  text TEXT,
+        \\  lang TEXT,
+        \\  possibly_sensitive INTEGER,
+        \\  raw_json TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS users (
+        \\  user_id TEXT PRIMARY KEY,
+        \\  username TEXT,
+        \\  name TEXT,
+        \\  description TEXT,
+        \\  profile_image_url TEXT,
+        \\  raw_json TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS media (
+        \\  media_key TEXT PRIMARY KEY,
+        \\  type TEXT,
+        \\  url TEXT,
+        \\  preview_image_url TEXT,
+        \\  raw_json TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS media_assets (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  media_key TEXT,
+        \\  asset_kind TEXT NOT NULL,
+        \\  source_url TEXT NOT NULL,
+        \\  local_path TEXT NOT NULL,
+        \\  content_type TEXT,
+        \\  byte_size INTEGER,
+        \\  sha256 TEXT,
+        \\  width INTEGER,
+        \\  height INTEGER,
+        \\  status TEXT NOT NULL,
+        \\  error_json TEXT,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_checked_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS tweet_media (
+        \\  tweet_id TEXT NOT NULL,
+        \\  media_key TEXT NOT NULL,
+        \\  position INTEGER,
+        \\  PRIMARY KEY (tweet_id, media_key)
+        \\);
+        \\CREATE TABLE IF NOT EXISTS bookmark_items (
+        \\  account_user_id TEXT NOT NULL,
+        \\  tweet_id TEXT NOT NULL,
+        \\  active INTEGER NOT NULL DEFAULT 1,
+        \\  complete_for_offline_render INTEGER NOT NULL DEFAULT 0,
+        \\  first_seen_run_id INTEGER NOT NULL,
+        \\  last_seen_run_id INTEGER NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL,
+        \\  import_position INTEGER,
+        \\  PRIMARY KEY (account_user_id, tweet_id)
+        \\);
+        \\CREATE TABLE IF NOT EXISTS bookmark_folders (
+        \\  account_user_id TEXT NOT NULL,
+        \\  folder_id TEXT NOT NULL,
+        \\  name TEXT,
+        \\  raw_json TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL,
+        \\  PRIMARY KEY (account_user_id, folder_id)
+        \\);
+        \\CREATE TABLE IF NOT EXISTS bookmark_folder_items (
+        \\  account_user_id TEXT NOT NULL,
+        \\  folder_id TEXT NOT NULL,
+        \\  tweet_id TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL,
+        \\  PRIMARY KEY (account_user_id, folder_id, tweet_id)
+        \\);
+        \\CREATE TABLE IF NOT EXISTS raw_pages (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  sync_run_id INTEGER NOT NULL,
+        \\  page_number INTEGER NOT NULL,
+        \\  pagination_token TEXT,
+        \\  next_token TEXT,
+        \\  result_count INTEGER,
+        \\  response_json TEXT NOT NULL,
+        \\  fetched_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS sync_warnings (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  sync_run_id INTEGER NOT NULL,
+        \\  warning_type TEXT NOT NULL,
+        \\  context_json TEXT NOT NULL,
+        \\  created_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS missing_references (
+        \\  tweet_id TEXT NOT NULL,
+        \\  referenced_tweet_id TEXT NOT NULL,
+        \\  reference_type TEXT NOT NULL,
+        \\  status TEXT NOT NULL,
+        \\  raw_json TEXT NOT NULL,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL,
+        \\  PRIMARY KEY (tweet_id, referenced_tweet_id, reference_type)
+        \\);
+        \\CREATE INDEX IF NOT EXISTS idx_bookmark_items_last_seen ON bookmark_items(account_user_id, last_seen_run_id);
+        \\CREATE INDEX IF NOT EXISTS idx_media_assets_status ON media_assets(status);
+        \\INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES ('001_initial', datetime('now'));
+    );
+}
+
+fn dbStatus(allocator: std.mem.Allocator, cfg: Config) !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("database path: {s}\n", .{cfg.database_path});
+    if (!fileExists(cfg.database_path)) {
+        try out.writeAll("database: missing\n");
+        return;
+    }
+    var db = try Db.open(cfg.database_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try printCount(&db, "schema_migrations");
+    try printCount(&db, "accounts");
+    try printCount(&db, "sync_runs");
+    try printCount(&db, "bookmark_items");
+    try printCount(&db, "tweets");
+    try printCount(&db, "users");
+    try printCount(&db, "media");
+    try printCount(&db, "media_assets");
+    try printCount(&db, "bookmark_folders");
+    try printCount(&db, "sync_warnings");
+}
+
+fn printCount(db: *Db, table: []const u8) !void {
+    var sql_buf: [128]u8 = undefined;
+    const sql = try std.fmt.bufPrint(&sql_buf, "SELECT count(*) FROM {s}", .{table});
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    const rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+    const count = c.sqlite3_column_int64(stmt, 0);
+    try std.fs.File.stdout().deprecatedWriter().print("{s}: {}\n", .{ table, count });
+}
+
+fn createSyncRun(db: *Db, account_user_id: []const u8, mode: []const u8, request_json: []const u8, allocator: std.mem.Allocator) !i64 {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare("INSERT INTO sync_runs(account_user_id, mode, status, started_at, request_params_json) VALUES (?, ?, 'running', ?, ?)");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, mode);
+    try bindText(stmt, 3, now);
+    try bindText(stmt, 4, request_json);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    return c.sqlite3_last_insert_rowid(db.handle);
+}
+
+fn finishSyncRun(db: *Db, run_id: i64, status: []const u8, pages: u32, tweets: u32, new_bookmarks: u32, early: bool, early_tweet_id: ?[]const u8, error_json: ?[]const u8, allocator: std.mem.Allocator) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        "UPDATE sync_runs SET status=?, finished_at=?, pages_requested=?, tweets_seen=?, new_bookmarks=?, early_stop_used=?, early_stop_tweet_id=?, error_json=? WHERE id=?",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, status);
+    try bindText(stmt, 2, now);
+    _ = c.sqlite3_bind_int(stmt, 3, @intCast(pages));
+    _ = c.sqlite3_bind_int(stmt, 4, @intCast(tweets));
+    _ = c.sqlite3_bind_int(stmt, 5, @intCast(new_bookmarks));
+    _ = c.sqlite3_bind_int(stmt, 6, if (early) 1 else 0);
+    if (early_tweet_id) |id| try bindText(stmt, 7, id) else _ = c.sqlite3_bind_null(stmt, 7);
+    if (error_json) |e| try bindText(stmt, 8, e) else _ = c.sqlite3_bind_null(stmt, 8);
+    _ = c.sqlite3_bind_int64(stmt, 9, run_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn beginTransaction(db: *Db) !void {
+    try db.exec("BEGIN IMMEDIATE;");
+}
+
+fn commitTransaction(db: *Db) !void {
+    try db.exec("COMMIT;");
+}
+
+fn rollbackTransaction(db: *Db) !void {
+    db.exec("ROLLBACK;") catch {};
+}
+
+const AccountInfo = struct {
+    user_id: []const u8,
+    username: []const u8,
+    name: []const u8,
+    raw_json: []u8,
+
+    fn deinit(self: AccountInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.user_id);
+        allocator.free(self.username);
+        allocator.free(self.name);
+        allocator.free(self.raw_json);
+    }
+};
+
+const SyncResult = struct {
+    pages: u32 = 0,
+    tweets: u32 = 0,
+    new_bookmarks: u32 = 0,
+    early_stop_used: bool = false,
+    early_stop_tweet_id: ?[]const u8 = null,
+    ordering_warning: bool = false,
+    cap_warning: bool = false,
+    folder_state_accounted: bool = true,
+};
+
+const SyncDiscovery = struct {
+    pages: u32 = 0,
+    tweets_seen: u32 = 0,
+    new_bookmarks: u32 = 0,
+    media_assets: u32 = 0,
+    early_stop_used: bool = false,
+};
+
+const ExistingAsset = struct {
+    media_key: []const u8,
+    asset_kind: []const u8,
+    local_path: []const u8,
+    content_type: []const u8,
+    byte_size: i64,
+    sha256: []const u8,
+
+    fn deinit(self: ExistingAsset, allocator: std.mem.Allocator) void {
+        allocator.free(self.media_key);
+        allocator.free(self.asset_kind);
+        allocator.free(self.local_path);
+        allocator.free(self.content_type);
+        allocator.free(self.sha256);
+    }
+};
+
+fn httpFetch(allocator: std.mem.Allocator, method: std.http.Method, url: []const u8, payload: ?[]const u8, headers: []const std.http.Header) !HttpResponse {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    var body_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer body_writer.deinit();
+
+    const uri = try std.Uri.parse(url);
+    const redirect_behavior: std.http.Client.Request.RedirectBehavior = if (payload == null) @enumFromInt(3) else .unhandled;
+    var req = try client.request(method, uri, .{
+        .redirect_behavior = redirect_behavior,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+        .extra_headers = headers,
+    });
+    defer req.deinit();
+
+    if (payload) |body| {
+        req.transfer_encoding = .{ .content_length = body.len };
+        var request_body = try req.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(body);
+        try request_body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    const redirect_buffer = try allocator.alloc(u8, 8 * 1024);
+    defer allocator.free(redirect_buffer);
+    var response = try req.receiveHead(redirect_buffer);
+    var rate_limit_reset: ?i64 = null;
+    var content_type: ?[]const u8 = null;
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "x-rate-limit-reset")) {
+            rate_limit_reset = std.fmt.parseInt(i64, header.value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            content_type = try allocator.dupe(u8, header.value);
+        }
+    }
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&body_writer.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    return .{ .status = response.head.status, .body = try body_writer.toOwnedSlice(), .content_type = content_type, .rate_limit_reset = rate_limit_reset };
+}
+
+fn freeHttpResponse(allocator: std.mem.Allocator, response: HttpResponse) void {
+    allocator.free(response.body);
+    if (response.content_type) |value| allocator.free(value);
+}
+
+const FormPair = struct { []const u8, []const u8 };
+
+fn oauthPayload(allocator: std.mem.Allocator, pairs: []const FormPair) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var first = true;
+    for (pairs) |pair| {
+        if (!first) try out.append(allocator, '&');
+        first = false;
+        const k = try urlEncode(allocator, pair[0]);
+        defer allocator.free(k);
+        const v = try urlEncode(allocator, pair[1]);
+        defer allocator.free(v);
+        try out.appendSlice(allocator, k);
+        try out.append(allocator, '=');
+        try out.appendSlice(allocator, v);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn oauthBasicAuthHeader(allocator: std.mem.Allocator, client_id: []const u8, client_secret: ?[]const u8) !?[]const u8 {
+    const secret = client_secret orelse return null;
+    const raw = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ client_id, secret });
+    defer allocator.free(raw);
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    return try std.fmt.allocPrint(allocator, "Basic {s}", .{encoded});
+}
+
+fn loadToken(allocator: std.mem.Allocator, token_path: []const u8) !TokenState {
+    const text = try std.fs.cwd().readFileAlloc(allocator, token_path, 4 * 1024 * 1024);
+    defer allocator.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    const access = getString(root, "access_token") orelse {
+        std.debug.print("token file does not contain access_token: {s}\n", .{token_path});
+        return AppError.AuthRequired;
+    };
+    const access_token = try allocator.dupe(u8, access);
+    errdefer allocator.free(access_token);
+    const refresh_token = try dupeOptionalString(allocator, getString(root, "refresh_token"));
+    errdefer if (refresh_token) |value| allocator.free(value);
+    const token_type = try dupeOptionalString(allocator, getString(root, "token_type"));
+    errdefer if (token_type) |value| allocator.free(value);
+    const scope = try dupeOptionalString(allocator, getString(root, "scope"));
+    errdefer if (scope) |value| allocator.free(value);
+    const account_user_id = try dupeOptionalString(allocator, getString(root, "account_user_id"));
+    errdefer if (account_user_id) |value| allocator.free(value);
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .token_type = token_type,
+        .scope = scope,
+        .expires_at = getInt(root, "expires_at"),
+        .account_user_id = account_user_id,
+    };
+}
+
+fn dupeOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |string| return try allocator.dupe(u8, string);
+    return null;
+}
+
+fn refreshTokenIfNeeded(allocator: std.mem.Allocator, cfg: Config, token: *TokenState) !void {
+    if (token.expires_at == null or token.refresh_token == null or token.expires_at.? > std.time.timestamp() + 300) return;
+    const refreshed = try refreshToken(allocator, cfg, token.*);
+    token.deinit(allocator);
+    token.* = refreshed;
+}
+
+fn refreshToken(allocator: std.mem.Allocator, cfg: Config, token: TokenState) !TokenState {
+    if (token.refresh_token == null) return AppError.AuthRequired;
+    const payload = if (cfg.client_secret != null) try oauthPayload(allocator, &.{
+        .{ "grant_type", "refresh_token" },
+        .{ "refresh_token", token.refresh_token.? },
+    }) else try oauthPayload(allocator, &.{
+        .{ "grant_type", "refresh_token" },
+        .{ "client_id", cfg.client_id },
+        .{ "refresh_token", token.refresh_token.? },
+    });
+    defer allocator.free(payload);
+    const basic_auth = try oauthBasicAuthHeader(allocator, cfg.client_id, cfg.client_secret);
+    defer if (basic_auth) |value| allocator.free(value);
+    var headers_buf = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+        .{ .name = "Accept", .value = "application/json" },
+        .{ .name = "Authorization", .value = "" },
+    };
+    var header_count: usize = 2;
+    if (basic_auth) |value| {
+        headers_buf[2] = .{ .name = "Authorization", .value = value };
+        header_count = 3;
+    }
+    const response = try httpFetch(allocator, .POST, "https://api.x.com/2/oauth2/token", payload, headers_buf[0..header_count]);
+    defer freeHttpResponse(allocator, response);
+    if (response.status != .ok) return AppError.AuthRequired;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const access = getString(parsed.value, "access_token") orelse return AppError.AuthRequired;
+    const refresh = getString(parsed.value, "refresh_token") orelse token.refresh_token.?;
+    const expires_in = getInt(parsed.value, "expires_in") orelse 0;
+    const expires_at = if (expires_in > 0) std.time.timestamp() + expires_in else 0;
+    const updated = try timestampString(allocator);
+    defer allocator.free(updated);
+    const account_json = try optionalJsonStringAlloc(allocator, nonEmptyOptional(token.account_user_id));
+    defer allocator.free(account_json);
+    const token_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"access_token\": {f},\n  \"refresh_token\": {f},\n  \"token_type\": {f},\n  \"scope\": {f},\n  \"expires_at\": {},\n  \"account_user_id\": {s},\n  \"updated_at\": {f}\n}}\n",
+        .{
+            std.json.fmt(access, .{}),
+            std.json.fmt(refresh, .{}),
+            std.json.fmt(getString(parsed.value, "token_type") orelse token.token_type orelse "bearer", .{}),
+            std.json.fmt(getString(parsed.value, "scope") orelse token.scope orelse default_scopes, .{}),
+            expires_at,
+            account_json,
+            std.json.fmt(updated, .{}),
+        },
+    );
+    defer allocator.free(token_json);
+    try writePrivateFile(cfg.token_path, token_json);
+    return try loadToken(allocator, cfg.token_path);
+}
+
+fn fetchMe(allocator: std.mem.Allocator, access_token: []const u8) !AccountInfo {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+    const url = x_api_base ++ "/users/me?user.fields=id,name,username,description,created_at,verified,verified_type,profile_image_url,profile_banner_url,public_metrics,url,location,protected";
+    const response = try httpFetch(allocator, .GET, url, null, &headers);
+    defer freeHttpResponse(allocator, response);
+    if (response.status != .ok) {
+        std.debug.print("/2/users/me failed HTTP {}\n", .{@intFromEnum(response.status)});
+        return AppError.AuthRequired;
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const data = getObject(parsed.value, "data") orelse return AppError.AuthRequired;
+    const raw = try jsonValueAlloc(allocator, data);
+    return .{
+        .user_id = try allocator.dupe(u8, getString(data, "id") orelse return AppError.AuthRequired),
+        .username = try allocator.dupe(u8, getString(data, "username") orelse ""),
+        .name = try allocator.dupe(u8, getString(data, "name") orelse ""),
+        .raw_json = raw,
+    };
+}
+
+fn syncRequestJson(allocator: std.mem.Allocator, cfg: Config, full: bool, yolo: bool, limit_pages: ?u32) ![]const u8 {
+    const limit_text = if (limit_pages) |n| try std.fmt.allocPrint(allocator, "{}", .{n}) else try allocator.dupe(u8, "null");
+    defer allocator.free(limit_text);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"mode\":\"{s}\",\"max_results\":{},\"download_media\":{},\"quote_post_depth\":{},\"limit_pages\":{s},\"yolo\":{},\"request_shape\":{{\"endpoint\":\"GET /2/users/:id/bookmarks\",\"tweet.fields\":{f},\"expansions\":{f},\"user.fields\":{f},\"media.fields\":{f},\"poll.fields\":{f}}},\"folder_request_shape\":{{\"folders_endpoint\":\"GET /2/users/:id/bookmarks/folders\",\"folder_items_endpoint\":\"GET /2/users/:id/bookmarks/folders/:folder_id\"}}}}",
+        .{
+            if (full) "full" else "incremental",
+            cfg.max_results,
+            cfg.download_media,
+            cfg.quote_post_depth,
+            limit_text,
+            yolo,
+            std.json.fmt(bookmark_tweet_fields, .{}),
+            std.json.fmt(bookmark_expansions, .{}),
+            std.json.fmt(bookmark_user_fields, .{}),
+            std.json.fmt(bookmark_media_fields, .{}),
+            std.json.fmt(bookmark_poll_fields, .{}),
+        },
+    );
+}
+
+fn runBookmarkSync(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_token: []const u8, account_user_id: []const u8, run_id: i64, full: bool, limit_pages: ?u32, wait_rate_limit: bool) !SyncResult {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+
+    var result = SyncResult{};
+    var next_token: ?[]u8 = null;
+    defer if (next_token) |value| allocator.free(value);
+    var page_number: u32 = 1;
+    while (true) : (page_number += 1) {
+        if (limit_pages) |max| if (page_number > max) break;
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: requesting bookmark page {} max_results={}\n", .{ page_number, cfg.max_results });
+        const url = try buildBookmarksUrl(allocator, account_user_id, cfg.max_results, next_token);
+        defer allocator.free(url);
+        const response = try httpFetch(allocator, .GET, url, null, &headers);
+        defer freeHttpResponse(allocator, response);
+        if (response.status == .too_many_requests) {
+            if (wait_rate_limit and response.rate_limit_reset != null) {
+                const now = std.time.timestamp();
+                if (response.rate_limit_reset.? > now) {
+                    const seconds = response.rate_limit_reset.? - now;
+                    try std.fs.File.stderr().deprecatedWriter().print("rate limited; waiting {} seconds until reset\n", .{seconds});
+                    std.Thread.sleep(@as(u64, @intCast(seconds)) * std.time.ns_per_s);
+                    page_number -= 1;
+                    continue;
+                }
+            }
+            if (response.rate_limit_reset) |reset| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited; x-rate-limit-reset={}\n", .{reset});
+            }
+            return AppError.RateLimited;
+        }
+        if (response.status == .unauthorized) return AppError.AuthRequired;
+        if (response.status != .ok) {
+            std.debug.print("bookmark page failed HTTP {}\n", .{@intFromEnum(response.status)});
+            return AppError.HttpError;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const meta = getObject(parsed.value, "meta");
+        const next = if (meta) |m| getString(m, "next_token") else null;
+        const result_count = if (meta) |m| getInt(m, "result_count") orelse 0 else 0;
+        const tweets_before_page = result.tweets;
+        try beginTransaction(db);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: storing bookmark page {} result_count={}\n", .{ page_number, result_count });
+        ingestBookmarkPage(db, allocator, cfg, account_user_id, run_id, full, page_number, next_token, next, result_count, response.body, parsed.value, &result) catch |err| {
+            try rollbackTransaction(db);
+            return err;
+        };
+        try commitTransaction(db);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: committed page {} tweets_seen={} new_bookmarks={} early_stop={}\n", .{ page_number, result.tweets, result.new_bookmarks, result.early_stop_used });
+        if (cfg.download_media and result.tweets > tweets_before_page) {
+            if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: downloading assets for page {}\n", .{page_number});
+            try downloadAssetsFromIncludes(db, allocator, cfg.assets_dir, parsed.value);
+            if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: finished assets for page {}\n", .{page_number});
+        }
+        result.pages += 1;
+        if (result.early_stop_used) break;
+        if (next) |tok| {
+            try replaceOwnedOptionalString(allocator, &next_token, tok);
+        } else {
+            if (result.tweets >= 800) result.cap_warning = true;
+            break;
+        }
+    }
+    if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().writeAll("sync: syncing bookmark folders\n");
+    result.folder_state_accounted = try syncFolders(db, allocator, access_token, account_user_id, run_id, wait_rate_limit);
+    if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("sync: bookmark folders accounted={}\n", .{result.folder_state_accounted});
+    return result;
+}
+
+fn discoverSyncWork(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_token: []const u8, account_user_id: []const u8, full: bool, limit_pages: ?u32, wait_rate_limit: bool) !SyncDiscovery {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+
+    var result = SyncDiscovery{};
+    var next_token: ?[]u8 = null;
+    defer if (next_token) |value| allocator.free(value);
+    var page_number: u32 = 1;
+    while (true) : (page_number += 1) {
+        if (limit_pages) |max| if (page_number > max) break;
+        const url = try buildBookmarksUrl(allocator, account_user_id, cfg.max_results, next_token);
+        defer allocator.free(url);
+        const response = try httpFetch(allocator, .GET, url, null, &headers);
+        defer freeHttpResponse(allocator, response);
+        if (response.status == .too_many_requests) {
+            if (rateLimitWaitSeconds(response, wait_rate_limit, std.time.timestamp())) |seconds| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited during discovery; waiting {} seconds until reset\n", .{seconds});
+                std.Thread.sleep(@as(u64, @intCast(seconds)) * std.time.ns_per_s);
+                page_number -= 1;
+                continue;
+            }
+            return AppError.RateLimited;
+        }
+        if (response.status == .unauthorized) return AppError.AuthRequired;
+        if (response.status != .ok) return AppError.HttpError;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        result.pages += 1;
+        result.media_assets += countPlannedMediaAssets(parsed.value);
+
+        if (getArray(parsed.value, "data")) |tweets| {
+            for (tweets.items) |tweet| {
+                if (tweet != .object) continue;
+                const tweet_id = getString(tweet, "id") orelse continue;
+                result.tweets_seen += 1;
+                if (!try bookmarkExists(db, account_user_id, tweet_id)) result.new_bookmarks += 1;
+                if (!full and cfg.stop_at_first_complete_bookmark and try isBookmarkComplete(db, account_user_id, tweet_id)) {
+                    result.early_stop_used = true;
+                    break;
+                }
+            }
+        }
+        if (result.early_stop_used) break;
+        const meta = getObject(parsed.value, "meta");
+        const next = if (meta) |m| getString(m, "next_token") else null;
+        if (next) |tok| try replaceOwnedOptionalString(allocator, &next_token, tok) else break;
+    }
+    return result;
+}
+
+fn replaceOwnedOptionalString(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    if (target.*) |old| allocator.free(old);
+    target.* = owned;
+}
+
+fn countPlannedMediaAssets(root: std.json.Value) u32 {
+    var count: u32 = 0;
+    const includes = getObject(root, "includes") orelse return 0;
+    if (getArray(includes, "media")) |media_arr| {
+        for (media_arr.items) |media| {
+            if (media != .object) continue;
+            if (getString(media, "url") != null) count += 1;
+            if (getString(media, "preview_image_url") != null) count += 1;
+            if (getArray(media, "variants")) |variants| {
+                if (variants.items.len > 0) count += 1;
+            }
+        }
+    }
+    if (getArray(includes, "users")) |users_arr| {
+        for (users_arr.items) |user| {
+            if (user != .object) continue;
+            if (getString(user, "profile_image_url") != null) count += 1;
+        }
+    }
+    return count;
+}
+
+fn buildBookmarksUrl(allocator: std.mem.Allocator, account_user_id: []const u8, max_results: u32, next_token: ?[]const u8) ![]const u8 {
+    const pagination = if (next_token) |tok| blk: {
+        const encoded = try urlEncode(allocator, tok);
+        defer allocator.free(encoded);
+        break :blk try std.fmt.allocPrint(allocator, "&pagination_token={s}", .{encoded});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(pagination);
+    return std.fmt.allocPrint(
+        allocator,
+        x_api_base ++ "/users/{s}/bookmarks?max_results={}&tweet.fields={s}&expansions={s}&user.fields={s}&media.fields={s}&poll.fields={s}{s}",
+        .{
+            account_user_id,
+            max_results,
+            bookmark_tweet_fields,
+            bookmark_expansions,
+            bookmark_user_fields,
+            bookmark_media_fields,
+            bookmark_poll_fields,
+            pagination,
+        },
+    );
+}
+
+fn ingestBookmarkPage(
+    db: *Db,
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    account_user_id: []const u8,
+    run_id: i64,
+    full: bool,
+    page_number: u32,
+    pagination_token: ?[]const u8,
+    next_token: ?[]const u8,
+    result_count: i64,
+    response_body: []const u8,
+    root: std.json.Value,
+    result: *SyncResult,
+) !void {
+    if (cfg.store_raw_pages) try insertRawPage(db, allocator, run_id, page_number, pagination_token, next_token, result_count, response_body);
+    try ingestIncludes(db, allocator, root);
+    if (getArray(root, "data")) |tweets| {
+        for (tweets.items, 0..) |tweet, idx| {
+            if (tweet != .object) continue;
+            const tweet_id = getString(tweet, "id") orelse continue;
+            if (!full and cfg.stop_at_first_complete_bookmark and try isBookmarkComplete(db, account_user_id, tweet_id)) {
+                result.early_stop_used = true;
+                result.early_stop_tweet_id = try allocator.dupe(u8, tweet_id);
+                break;
+            }
+            try upsertTweetFromValue(db, allocator, tweet);
+            try recordMissingQuoteReferences(db, allocator, root, tweet);
+            const complete = try bookmarkCompleteForOfflineRender(db, allocator, tweet_id);
+            const position: i64 = @intCast((page_number - 1) * cfg.max_results + @as(u32, @intCast(idx)));
+            if (!full) {
+                if (try previousImportPosition(db, account_user_id, tweet_id)) |previous| {
+                    if (previous > position) result.ordering_warning = true;
+                }
+            }
+            const was_new = try upsertBookmarkItem(db, allocator, account_user_id, tweet_id, run_id, position, complete);
+            if (was_new) result.new_bookmarks += 1;
+            result.tweets += 1;
+        }
+    }
+}
+
+fn upsertAccount(db: *Db, allocator: std.mem.Allocator, user_id: []const u8, username: []const u8, name: []const u8, raw_json: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO accounts(user_id, username, name, raw_json, created_at, updated_at)
+        \\VALUES (?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, name=excluded.name, raw_json=excluded.raw_json, updated_at=excluded.updated_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, user_id);
+    try bindText(stmt, 2, username);
+    try bindText(stmt, 3, name);
+    try bindText(stmt, 4, raw_json);
+    try bindText(stmt, 5, now);
+    try bindText(stmt, 6, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertTokenObservation(db: *Db, allocator: std.mem.Allocator, user_id: []const u8, token_type: []const u8, scope: []const u8, expires_at: i64, token_path: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const exp = try std.fmt.allocPrint(allocator, "{}", .{expires_at});
+    defer allocator.free(exp);
+    const stmt = try db.prepare(
+        \\INSERT INTO oauth_token_observations(account_user_id, token_type, scope, expires_at, token_file_path, created_at, updated_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(account_user_id) DO UPDATE SET token_type=excluded.token_type, scope=excluded.scope, expires_at=excluded.expires_at, token_file_path=excluded.token_file_path, updated_at=excluded.updated_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, user_id);
+    try bindText(stmt, 2, token_type);
+    try bindText(stmt, 3, scope);
+    try bindText(stmt, 4, exp);
+    try bindText(stmt, 5, token_path);
+    try bindText(stmt, 6, now);
+    try bindText(stmt, 7, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertTokenObservationFromState(db: *Db, allocator: std.mem.Allocator, cfg: Config, account_user_id: []const u8, token: TokenState) !void {
+    try upsertTokenObservation(
+        db,
+        allocator,
+        account_user_id,
+        token.token_type orelse "bearer",
+        token.scope orelse default_scopes,
+        token.expires_at orelse 0,
+        cfg.token_path,
+    );
+}
+
+fn insertRawPage(db: *Db, allocator: std.mem.Allocator, run_id: i64, page_number: u32, pagination_token: ?[]const u8, next_token: ?[]const u8, result_count: i64, response_json: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        "INSERT INTO raw_pages(sync_run_id, page_number, pagination_token, next_token, result_count, response_json, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, run_id);
+    _ = c.sqlite3_bind_int(stmt, 2, @intCast(page_number));
+    if (pagination_token) |v| try bindText(stmt, 3, v) else _ = c.sqlite3_bind_null(stmt, 3);
+    if (next_token) |v| try bindText(stmt, 4, v) else _ = c.sqlite3_bind_null(stmt, 4);
+    _ = c.sqlite3_bind_int64(stmt, 5, result_count);
+    try bindText(stmt, 6, response_json);
+    try bindText(stmt, 7, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn recordSyncWarning(db: *Db, allocator: std.mem.Allocator, run_id: i64, warning_type: []const u8, context_json: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        "INSERT INTO sync_warnings(sync_run_id, warning_type, context_json, created_at) VALUES (?, ?, ?, ?)",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, run_id);
+    try bindText(stmt, 2, warning_type);
+    try bindText(stmt, 3, context_json);
+    try bindText(stmt, 4, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn ingestIncludes(db: *Db, allocator: std.mem.Allocator, root: std.json.Value) !void {
+    const includes = getObject(root, "includes") orelse return;
+    if (getArray(includes, "users")) |users_arr| {
+        for (users_arr.items) |user| {
+            if (user != .object) continue;
+            try upsertUserFromValue(db, allocator, user);
+        }
+    }
+    if (getArray(includes, "media")) |media_arr| {
+        for (media_arr.items) |media| {
+            if (media != .object) continue;
+            try upsertMediaFromValue(db, allocator, media);
+        }
+    }
+    if (getArray(includes, "tweets")) |tweets_arr| {
+        for (tweets_arr.items) |tweet| {
+            if (tweet != .object) continue;
+            try upsertTweetFromValue(db, allocator, tweet);
+        }
+    }
+}
+
+fn upsertTweetFromValue(db: *Db, allocator: std.mem.Allocator, tweet: std.json.Value) !void {
+    const tweet_id = getString(tweet, "id") orelse return;
+    const author_id = getString(tweet, "author_id");
+    const username = if (author_id) |aid| try usernameForUser(db, allocator, aid) else null;
+    defer if (username) |u| allocator.free(u);
+    const canonical = try canonicalUri(allocator, username, tweet_id);
+    defer allocator.free(canonical);
+    const twitter = try std.fmt.allocPrint(allocator, "https://twitter.com/i/web/status/{s}", .{tweet_id});
+    defer allocator.free(twitter);
+    const raw = try jsonValueAlloc(allocator, tweet);
+    defer allocator.free(raw);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+
+    const stmt = try db.prepare(
+        \\INSERT INTO tweets(tweet_id, author_id, conversation_id, canonical_uri, twitter_uri, created_at, text, lang, possibly_sensitive, raw_json, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(tweet_id) DO UPDATE SET author_id=excluded.author_id, conversation_id=excluded.conversation_id, canonical_uri=excluded.canonical_uri, twitter_uri=excluded.twitter_uri, created_at=excluded.created_at, text=excluded.text, lang=excluded.lang, possibly_sensitive=excluded.possibly_sensitive, raw_json=excluded.raw_json, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (author_id) |v| try bindText(stmt, 2, v) else _ = c.sqlite3_bind_null(stmt, 2);
+    if (getString(tweet, "conversation_id")) |v| try bindText(stmt, 3, v) else _ = c.sqlite3_bind_null(stmt, 3);
+    try bindText(stmt, 4, canonical);
+    try bindText(stmt, 5, twitter);
+    if (getString(tweet, "created_at")) |v| try bindText(stmt, 6, v) else _ = c.sqlite3_bind_null(stmt, 6);
+    if (getString(tweet, "text")) |v| try bindText(stmt, 7, v) else _ = c.sqlite3_bind_null(stmt, 7);
+    if (getString(tweet, "lang")) |v| try bindText(stmt, 8, v) else _ = c.sqlite3_bind_null(stmt, 8);
+    if (getBool(tweet, "possibly_sensitive")) |v| _ = c.sqlite3_bind_int(stmt, 9, if (v) 1 else 0) else _ = c.sqlite3_bind_null(stmt, 9);
+    try bindText(stmt, 10, raw);
+    try bindText(stmt, 11, now);
+    try bindText(stmt, 12, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    try upsertTweetMedia(db, tweet_id, tweet);
+}
+
+fn upsertUserFromValue(db: *Db, allocator: std.mem.Allocator, user: std.json.Value) !void {
+    const user_id = getString(user, "id") orelse return;
+    const raw = try jsonValueAlloc(allocator, user);
+    defer allocator.free(raw);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO users(user_id, username, name, description, profile_image_url, raw_json, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, name=excluded.name, description=excluded.description, profile_image_url=excluded.profile_image_url, raw_json=excluded.raw_json, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, user_id);
+    if (getString(user, "username")) |v| try bindText(stmt, 2, v) else _ = c.sqlite3_bind_null(stmt, 2);
+    if (getString(user, "name")) |v| try bindText(stmt, 3, v) else _ = c.sqlite3_bind_null(stmt, 3);
+    if (getString(user, "description")) |v| try bindText(stmt, 4, v) else _ = c.sqlite3_bind_null(stmt, 4);
+    if (getString(user, "profile_image_url")) |v| try bindText(stmt, 5, v) else _ = c.sqlite3_bind_null(stmt, 5);
+    try bindText(stmt, 6, raw);
+    try bindText(stmt, 7, now);
+    try bindText(stmt, 8, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertMediaFromValue(db: *Db, allocator: std.mem.Allocator, media: std.json.Value) !void {
+    const media_key = getString(media, "media_key") orelse return;
+    const raw = try jsonValueAlloc(allocator, media);
+    defer allocator.free(raw);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO media(media_key, type, url, preview_image_url, raw_json, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(media_key) DO UPDATE SET type=excluded.type, url=excluded.url, preview_image_url=excluded.preview_image_url, raw_json=excluded.raw_json, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    if (getString(media, "type")) |v| try bindText(stmt, 2, v) else _ = c.sqlite3_bind_null(stmt, 2);
+    if (getString(media, "url")) |v| try bindText(stmt, 3, v) else _ = c.sqlite3_bind_null(stmt, 3);
+    if (getString(media, "preview_image_url")) |v| try bindText(stmt, 4, v) else _ = c.sqlite3_bind_null(stmt, 4);
+    try bindText(stmt, 5, raw);
+    try bindText(stmt, 6, now);
+    try bindText(stmt, 7, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertTweetMedia(db: *Db, tweet_id: []const u8, tweet: std.json.Value) !void {
+    try deleteTweetMedia(db, tweet_id);
+    const attachments = getObject(tweet, "attachments") orelse return;
+    const keys = getArray(attachments, "media_keys") orelse return;
+    for (keys.items, 0..) |item, idx| {
+        if (item != .string) continue;
+        const stmt = try db.prepare("INSERT OR REPLACE INTO tweet_media(tweet_id, media_key, position) VALUES (?, ?, ?)");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, tweet_id);
+        try bindText(stmt, 2, item.string);
+        _ = c.sqlite3_bind_int(stmt, 3, @intCast(idx));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    }
+}
+
+fn deleteTweetMedia(db: *Db, tweet_id: []const u8) !void {
+    const stmt = try db.prepare("DELETE FROM tweet_media WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn recordMissingQuoteReferences(db: *Db, allocator: std.mem.Allocator, root: std.json.Value, tweet: std.json.Value) !void {
+    const tweet_id = getString(tweet, "id") orelse return;
+    const refs = getArray(tweet, "referenced_tweets") orelse return;
+    for (refs.items) |ref| {
+        if (ref != .object) continue;
+        if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+        const referenced_id = getString(ref, "id") orelse continue;
+        if (try tweetExists(db, referenced_id)) continue;
+        const matching_error = findErrorForReference(root, referenced_id);
+        const status = if (matching_error) |err| missingStatusFromError(allocator, err) else "missing";
+        const raw = try jsonValueAlloc(allocator, matching_error orelse ref);
+        defer allocator.free(raw);
+        const now = try timestampString(allocator);
+        defer allocator.free(now);
+        const stmt = try db.prepare(
+            \\INSERT INTO missing_references(tweet_id, referenced_tweet_id, reference_type, status, raw_json, first_seen_at, last_seen_at)
+            \\VALUES (?, ?, 'quoted', ?, ?, ?, ?)
+            \\ON CONFLICT(tweet_id, referenced_tweet_id, reference_type) DO UPDATE SET status=excluded.status, raw_json=excluded.raw_json, last_seen_at=excluded.last_seen_at
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, tweet_id);
+        try bindText(stmt, 2, referenced_id);
+        try bindText(stmt, 3, status);
+        try bindText(stmt, 4, raw);
+        try bindText(stmt, 5, now);
+        try bindText(stmt, 6, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    }
+}
+
+fn findErrorForReference(root: std.json.Value, referenced_id: []const u8) ?std.json.Value {
+    const errors = getArray(root, "errors") orelse return null;
+    for (errors.items) |err| {
+        if (err != .object) continue;
+        if (errorMentionsReference(err, referenced_id)) return err;
+    }
+    return null;
+}
+
+fn errorMentionsReference(err: std.json.Value, referenced_id: []const u8) bool {
+    if (getString(err, "resource_id")) |v| if (std.mem.eql(u8, v, referenced_id)) return true;
+    if (getString(err, "value")) |v| if (std.mem.eql(u8, v, referenced_id)) return true;
+    if (getString(err, "id")) |v| if (std.mem.eql(u8, v, referenced_id)) return true;
+    var buf: [4096]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&buf);
+    stream.print("{f}", .{std.json.fmt(err, .{})}) catch return false;
+    return std.mem.indexOf(u8, stream.buffered(), referenced_id) != null;
+}
+
+fn missingStatusFromError(allocator: std.mem.Allocator, err: std.json.Value) []const u8 {
+    const raw = jsonValueAlloc(allocator, err) catch return "missing";
+    defer allocator.free(raw);
+    if (containsIgnoreCase(raw, "protected")) return "protected";
+    if (containsIgnoreCase(raw, "deleted")) return "deleted";
+    if (containsIgnoreCase(raw, "not found")) return "not_found";
+    if (containsIgnoreCase(raw, "unavailable")) return "unavailable";
+    return "missing";
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        } else return true;
+    }
+    return false;
+}
+
+fn tweetExists(db: *Db, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM tweets WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn upsertBookmarkItem(db: *Db, allocator: std.mem.Allocator, account_user_id: []const u8, tweet_id: []const u8, run_id: i64, import_position: i64, complete: bool) !bool {
+    const was_existing = try bookmarkExists(db, account_user_id, tweet_id);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO bookmark_items(account_user_id, tweet_id, active, complete_for_offline_render, first_seen_run_id, last_seen_run_id, first_seen_at, last_seen_at, import_position)
+        \\VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(account_user_id, tweet_id) DO UPDATE SET active=1, complete_for_offline_render=excluded.complete_for_offline_render, last_seen_run_id=excluded.last_seen_run_id, last_seen_at=excluded.last_seen_at, import_position=excluded.import_position
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, tweet_id);
+    _ = c.sqlite3_bind_int(stmt, 3, if (complete) 1 else 0);
+    _ = c.sqlite3_bind_int64(stmt, 4, run_id);
+    _ = c.sqlite3_bind_int64(stmt, 5, run_id);
+    try bindText(stmt, 6, now);
+    try bindText(stmt, 7, now);
+    _ = c.sqlite3_bind_int64(stmt, 8, import_position);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    return !was_existing;
+}
+
+fn bookmarkCompleteForOfflineRender(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    if (!try tweetExists(db, tweet_id)) return false;
+    if (!try tweetAuthorMetadataComplete(db, allocator, tweet_id)) return false;
+    if (!try tweetRequiredAssetsPresent(db, allocator, tweet_id)) return false;
+    if (try tweetHasFailedAssets(db, allocator, tweet_id)) return false;
+
+    const raw = try tweetRawJson(db, allocator, tweet_id);
+    defer if (raw) |value| allocator.free(value);
+    if (raw) |json| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return false;
+        defer parsed.deinit();
+        if (getArray(parsed.value, "referenced_tweets")) |refs| {
+            for (refs.items) |ref| {
+                if (ref != .object) continue;
+                if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+                const quote_id = getString(ref, "id") orelse return false;
+                if (try tweetExists(db, quote_id)) {
+                    if (!try tweetAuthorMetadataComplete(db, allocator, quote_id)) return false;
+                    if (!try tweetRequiredAssetsPresent(db, allocator, quote_id)) return false;
+                } else if (!try missingReferenceExists(db, tweet_id, quote_id, "quoted")) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+fn tweetRequiredAssetsPresent(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    if (!try tweetMediaAssetsPresent(db, allocator, tweet_id)) return false;
+    const author = try tweetAuthorId(db, allocator, tweet_id);
+    defer if (author) |value| allocator.free(value);
+    if (author) |author_id| {
+        if (try userAvatarRequired(db, allocator, author_id)) {
+            const key = try std.fmt.allocPrint(allocator, "user:{s}", .{author_id});
+            defer allocator.free(key);
+            if (!try assetPresentForMediaKeyKind(db, key, "author_avatar")) return false;
+        }
+    }
+    return true;
+}
+
+fn tweetMediaAssetsPresent(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT media_key FROM tweet_media WHERE tweet_id=? ORDER BY position");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const media_key = colText(stmt, 0);
+        const raw = try mediaRawJson(db, allocator, media_key) orelse return false;
+        defer allocator.free(raw);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+        defer parsed.deinit();
+        if (getString(parsed.value, "url") != null and !try assetPresentForMediaKeyKind(db, media_key, "image")) return false;
+        if (getString(parsed.value, "preview_image_url") != null and !try assetPresentForMediaKeyKind(db, media_key, "preview_image")) return false;
+        if (getArray(parsed.value, "variants")) |variants| {
+            if (variants.items.len > 0 and !try videoAssetPresentForMediaKey(db, media_key)) return false;
+        }
+    }
+    return true;
+}
+
+fn userAvatarRequired(db: *Db, allocator: std.mem.Allocator, user_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT profile_image_url FROM users WHERE user_id=? AND profile_image_url IS NOT NULL AND profile_image_url <> ''");
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = allocator;
+    try bindText(stmt, 1, user_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn mediaRawJson(db: *Db, allocator: std.mem.Allocator, media_key: []const u8) !?[]const u8 {
+    const stmt = try db.prepare("SELECT raw_json FROM media WHERE media_key=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return try allocator.dupe(u8, colText(stmt, 0));
+}
+
+fn assetPresentForMediaKeyKind(db: *Db, media_key: []const u8, kind: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND asset_kind=? AND status IN ('downloaded', 'ok', 'skipped') LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    try bindText(stmt, 2, kind);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn videoAssetPresentForMediaKey(db: *Db, media_key: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND asset_kind IN ('video_variant', 'animated_gif_variant') AND status IN ('downloaded', 'ok', 'skipped') LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn tweetAuthorMetadataComplete(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    const author = try tweetAuthorId(db, allocator, tweet_id);
+    defer if (author) |value| allocator.free(value);
+    if (author) |author_id| {
+        if (author_id.len == 0) return true;
+        return userExists(db, author_id);
+    }
+    return true;
+}
+
+fn tweetHasFailedAssets(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
+    if (try tweetOwnAssetsFailed(db, tweet_id)) return true;
+    const author = try tweetAuthorId(db, allocator, tweet_id);
+    defer if (author) |value| allocator.free(value);
+    if (author) |author_id| {
+        const key = try std.fmt.allocPrint(allocator, "user:{s}", .{author_id});
+        defer allocator.free(key);
+        if (try failedAssetForMediaKey(db, key)) return true;
+    }
+
+    const raw = try tweetRawJson(db, allocator, tweet_id);
+    defer if (raw) |value| allocator.free(value);
+    if (raw) |json| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return false;
+        defer parsed.deinit();
+        if (getArray(parsed.value, "referenced_tweets")) |refs| {
+            for (refs.items) |ref| {
+                if (ref != .object) continue;
+                if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+                const quote_id = getString(ref, "id") orelse continue;
+                if (try tweetOwnAssetsFailed(db, quote_id)) return true;
+                const quote_author = try tweetAuthorId(db, allocator, quote_id);
+                defer if (quote_author) |value| allocator.free(value);
+                if (quote_author) |quote_author_id| {
+                    const key = try std.fmt.allocPrint(allocator, "user:{s}", .{quote_author_id});
+                    defer allocator.free(key);
+                    if (try failedAssetForMediaKey(db, key)) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+fn tweetOwnAssetsFailed(db: *Db, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare(
+        \\SELECT 1
+        \\FROM tweet_media tm
+        \\JOIN media_assets ma ON ma.media_key = tm.media_key
+        \\WHERE tm.tweet_id = ? AND ma.status = 'failed'
+        \\LIMIT 1
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn failedAssetForMediaKey(db: *Db, media_key: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND status='failed' LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn tweetAuthorId(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !?[]const u8 {
+    const stmt = try db.prepare("SELECT author_id FROM tweets WHERE tweet_id=? AND author_id IS NOT NULL");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return try allocator.dupe(u8, colText(stmt, 0));
+}
+
+fn tweetRawJson(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !?[]const u8 {
+    const stmt = try db.prepare("SELECT raw_json FROM tweets WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return try allocator.dupe(u8, colText(stmt, 0));
+}
+
+fn userExists(db: *Db, user_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM users WHERE user_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, user_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn missingReferenceExists(db: *Db, tweet_id: []const u8, referenced_tweet_id: []const u8, reference_type: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM missing_references WHERE tweet_id=? AND referenced_tweet_id=? AND reference_type=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    try bindText(stmt, 2, referenced_tweet_id);
+    try bindText(stmt, 3, reference_type);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn bookmarkExists(db: *Db, account_user_id: []const u8, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM bookmark_items WHERE account_user_id=? AND tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn markBookmarksInactiveNotSeen(db: *Db, account_user_id: []const u8, run_id: i64) !void {
+    const stmt = try db.prepare("UPDATE bookmark_items SET active=0 WHERE account_user_id=? AND active=1 AND last_seen_run_id<>?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    _ = c.sqlite3_bind_int64(stmt, 2, run_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn markRunBookmarksIncomplete(db: *Db, account_user_id: []const u8, run_id: i64) !void {
+    const stmt = try db.prepare("UPDATE bookmark_items SET complete_for_offline_render=0 WHERE account_user_id=? AND last_seen_run_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    _ = c.sqlite3_bind_int64(stmt, 2, run_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn refreshBookmarkCompletenessForRun(db: *Db, allocator: std.mem.Allocator, account_user_id: []const u8, run_id: i64, folder_state_accounted: bool) !void {
+    const stmt = try db.prepare("SELECT tweet_id FROM bookmark_items WHERE account_user_id=? AND last_seen_run_id=? ORDER BY import_position");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    _ = c.sqlite3_bind_int64(stmt, 2, run_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const tweet_id = try allocator.dupe(u8, colText(stmt, 0));
+        defer allocator.free(tweet_id);
+        try updateBookmarkCompleteness(db, account_user_id, tweet_id, folder_state_accounted and try bookmarkCompleteForOfflineRender(db, allocator, tweet_id));
+    }
+}
+
+fn updateBookmarkCompleteness(db: *Db, account_user_id: []const u8, tweet_id: []const u8, complete: bool) !void {
+    const stmt = try db.prepare("UPDATE bookmark_items SET complete_for_offline_render=? WHERE account_user_id=? AND tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int(stmt, 1, if (complete) 1 else 0);
+    try bindText(stmt, 2, account_user_id);
+    try bindText(stmt, 3, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn previousImportPosition(db: *Db, account_user_id: []const u8, tweet_id: []const u8) !?i64 {
+    const stmt = try db.prepare("SELECT import_position FROM bookmark_items WHERE account_user_id=? AND tweet_id=? AND import_position IS NOT NULL");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn isBookmarkComplete(db: *Db, account_user_id: []const u8, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT complete_for_offline_render FROM bookmark_items WHERE account_user_id=? AND tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+    return c.sqlite3_column_int(stmt, 0) != 0;
+}
+
+fn usernameForUser(db: *Db, allocator: std.mem.Allocator, user_id: []const u8) !?[]const u8 {
+    const stmt = try db.prepare("SELECT username FROM users WHERE user_id=? AND username IS NOT NULL");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, user_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return try allocator.dupe(u8, colText(stmt, 0));
+}
+
+fn canonicalUri(allocator: std.mem.Allocator, username: ?[]const u8, tweet_id: []const u8) ![]const u8 {
+    if (username) |u| if (u.len > 0) return std.fmt.allocPrint(allocator, "https://x.com/{s}/status/{s}", .{ u, tweet_id });
+    return std.fmt.allocPrint(allocator, "https://x.com/i/web/status/{s}", .{tweet_id});
+}
+
+fn rateLimitWaitSeconds(response: HttpResponse, wait_rate_limit: bool, now: i64) ?i64 {
+    if (!wait_rate_limit) return null;
+    const reset = response.rate_limit_reset orelse return null;
+    if (reset <= now) return null;
+    return reset - now;
+}
+
+fn syncFolders(db: *Db, allocator: std.mem.Allocator, access_token: []const u8, account_user_id: []const u8, run_id: i64, wait_rate_limit: bool) !bool {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+
+    var next_token: ?[]u8 = null;
+    defer if (next_token) |value| allocator.free(value);
+    var page_number: u32 = 1;
+    while (true) {
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("folders: requesting folder page {}\n", .{page_number});
+        const url = try buildBookmarkFoldersUrl(allocator, account_user_id, next_token);
+        defer allocator.free(url);
+        const response = httpFetch(allocator, .GET, url, null, &headers) catch |err| {
+            const context = try std.fmt.allocPrint(allocator, "{{\"endpoint\":\"folders\",\"error\":\"{}\"}}", .{err});
+            defer allocator.free(context);
+            try recordSyncWarning(db, allocator, run_id, "bookmark_folder_sync_failed", context);
+            try std.fs.File.stderr().deprecatedWriter().print("warning: bookmark folder sync failed: {}\n", .{err});
+            return false;
+        };
+        defer freeHttpResponse(allocator, response);
+        if (response.status == .too_many_requests) {
+            if (rateLimitWaitSeconds(response, wait_rate_limit, std.time.timestamp())) |seconds| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited during folder sync; waiting {} seconds until reset\n", .{seconds});
+                std.Thread.sleep(@as(u64, @intCast(seconds)) * std.time.ns_per_s);
+                continue;
+            }
+            if (response.rate_limit_reset) |reset| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited during folder sync; x-rate-limit-reset={}\n", .{reset});
+            }
+            return AppError.RateLimited;
+        }
+        if (response.status != .ok) {
+            const context = try std.fmt.allocPrint(allocator, "{{\"endpoint\":\"folders\",\"http_status\":{}}}", .{@intFromEnum(response.status)});
+            defer allocator.free(context);
+            try recordSyncWarning(db, allocator, run_id, "bookmark_folder_sync_failed", context);
+            try std.fs.File.stderr().deprecatedWriter().print("warning: bookmark folder sync returned HTTP {}\n", .{@intFromEnum(response.status)});
+            return false;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        var folders_seen: u32 = 0;
+        if (getArray(parsed.value, "data")) |data| {
+            folders_seen = @intCast(data.items.len);
+            if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("folders: page {} returned {} folder(s)\n", .{ page_number, folders_seen });
+            for (data.items) |folder| {
+                if (folder != .object) continue;
+                try upsertFolderFromValue(db, allocator, account_user_id, folder);
+                const folder_id = getString(folder, "id") orelse getString(folder, "folder_id") orelse continue;
+                if (!try syncFolderItems(db, allocator, access_token, account_user_id, folder_id, run_id, wait_rate_limit)) return false;
+            }
+        }
+        const meta = getObject(parsed.value, "meta");
+        if (meta) |m| {
+            if (getString(m, "next_token")) |tok| {
+                try replaceOwnedOptionalString(allocator, &next_token, tok);
+                page_number += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    return true;
+}
+
+fn buildBookmarkFoldersUrl(allocator: std.mem.Allocator, account_user_id: []const u8, next_token: ?[]const u8) ![]const u8 {
+    const pagination = if (next_token) |tok| blk: {
+        const encoded = try urlEncode(allocator, tok);
+        defer allocator.free(encoded);
+        break :blk try std.fmt.allocPrint(allocator, "?pagination_token={s}", .{encoded});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(pagination);
+    return std.fmt.allocPrint(allocator, x_api_base ++ "/users/{s}/bookmarks/folders{s}", .{ account_user_id, pagination });
+}
+
+fn buildBookmarkFolderItemsUrl(allocator: std.mem.Allocator, account_user_id: []const u8, encoded_folder_id: []const u8, next_token: ?[]const u8) ![]const u8 {
+    const pagination = if (next_token) |tok| blk: {
+        const encoded = try urlEncode(allocator, tok);
+        defer allocator.free(encoded);
+        break :blk try std.fmt.allocPrint(allocator, "?pagination_token={s}", .{encoded});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(pagination);
+    return std.fmt.allocPrint(allocator, x_api_base ++ "/users/{s}/bookmarks/folders/{s}{s}", .{ account_user_id, encoded_folder_id, pagination });
+}
+
+fn syncFolderItems(db: *Db, allocator: std.mem.Allocator, access_token: []const u8, account_user_id: []const u8, folder_id: []const u8, run_id: i64, wait_rate_limit: bool) !bool {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const encoded_folder = try urlEncode(allocator, folder_id);
+    defer allocator.free(encoded_folder);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+    var next_token: ?[]u8 = null;
+    defer if (next_token) |value| allocator.free(value);
+    try beginFolderItemPrune(db);
+    var page_number: u32 = 1;
+    while (true) {
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("folders: requesting items for folder {s} page {}\n", .{ folder_id, page_number });
+        const url = try buildBookmarkFolderItemsUrl(allocator, account_user_id, encoded_folder, next_token);
+        defer allocator.free(url);
+        const response = httpFetch(allocator, .GET, url, null, &headers) catch |err| {
+            const context = try std.fmt.allocPrint(allocator, "{{\"endpoint\":\"folder_items\",\"folder_id\":{f},\"error\":\"{}\"}}", .{ std.json.fmt(folder_id, .{}), err });
+            defer allocator.free(context);
+            try recordSyncWarning(db, allocator, run_id, "bookmark_folder_item_sync_failed", context);
+            try std.fs.File.stderr().deprecatedWriter().print("warning: bookmark folder item sync failed for folder {s}: {}\n", .{ folder_id, err });
+            return false;
+        };
+        defer freeHttpResponse(allocator, response);
+        if (response.status == .too_many_requests) {
+            if (rateLimitWaitSeconds(response, wait_rate_limit, std.time.timestamp())) |seconds| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited during folder item sync for folder {s}; waiting {} seconds until reset\n", .{ folder_id, seconds });
+                std.Thread.sleep(@as(u64, @intCast(seconds)) * std.time.ns_per_s);
+                continue;
+            }
+            if (response.rate_limit_reset) |reset| {
+                try std.fs.File.stderr().deprecatedWriter().print("rate limited during folder item sync for folder {s}; x-rate-limit-reset={}\n", .{ folder_id, reset });
+            }
+            return AppError.RateLimited;
+        }
+        if (response.status != .ok) {
+            const context = try std.fmt.allocPrint(allocator, "{{\"endpoint\":\"folder_items\",\"folder_id\":{f},\"http_status\":{}}}", .{ std.json.fmt(folder_id, .{}), @intFromEnum(response.status) });
+            defer allocator.free(context);
+            try recordSyncWarning(db, allocator, run_id, "bookmark_folder_item_sync_failed", context);
+            try std.fs.File.stderr().deprecatedWriter().print("warning: bookmark folder item sync for folder {s} returned HTTP {}\n", .{ folder_id, @intFromEnum(response.status) });
+            return false;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        var items_seen: u32 = 0;
+        if (getArray(parsed.value, "data")) |tweets| {
+            items_seen = @intCast(tweets.items.len);
+            for (tweets.items) |tweet| {
+                if (tweet != .object) continue;
+                const tweet_id = getString(tweet, "id") orelse continue;
+                try upsertFolderItem(db, allocator, account_user_id, folder_id, tweet_id);
+                try rememberFolderItemForPrune(db, tweet_id);
+            }
+        }
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("folders: folder {s} page {} returned {} item(s)\n", .{ folder_id, page_number, items_seen });
+        const meta = getObject(parsed.value, "meta");
+        if (meta) |m| {
+            if (getString(m, "next_token")) |tok| {
+                try replaceOwnedOptionalString(allocator, &next_token, tok);
+                page_number += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    try pruneFolderItemsNotSeen(db, account_user_id, folder_id);
+    return true;
+}
+
+fn upsertFolderItem(db: *Db, allocator: std.mem.Allocator, account_user_id: []const u8, folder_id: []const u8, tweet_id: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO bookmark_folder_items(account_user_id, folder_id, tweet_id, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?)
+        \\ON CONFLICT(account_user_id, folder_id, tweet_id) DO UPDATE SET last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, folder_id);
+    try bindText(stmt, 3, tweet_id);
+    try bindText(stmt, 4, now);
+    try bindText(stmt, 5, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn beginFolderItemPrune(db: *Db) !void {
+    try db.exec(
+        \\CREATE TEMP TABLE IF NOT EXISTS current_folder_items(tweet_id TEXT PRIMARY KEY);
+        \\DELETE FROM current_folder_items;
+    );
+}
+
+fn rememberFolderItemForPrune(db: *Db, tweet_id: []const u8) !void {
+    const stmt = try db.prepare("INSERT OR IGNORE INTO current_folder_items(tweet_id) VALUES (?)");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn pruneFolderItemsNotSeen(db: *Db, account_user_id: []const u8, folder_id: []const u8) !void {
+    const stmt = try db.prepare(
+        \\DELETE FROM bookmark_folder_items
+        \\WHERE account_user_id=? AND folder_id=? AND tweet_id NOT IN (SELECT tweet_id FROM current_folder_items)
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, folder_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertFolderFromValue(db: *Db, allocator: std.mem.Allocator, account_user_id: []const u8, folder: std.json.Value) !void {
+    const folder_id = getString(folder, "id") orelse getString(folder, "folder_id") orelse return;
+    const raw = try jsonValueAlloc(allocator, folder);
+    defer allocator.free(raw);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO bookmark_folders(account_user_id, folder_id, name, raw_json, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(account_user_id, folder_id) DO UPDATE SET name=excluded.name, raw_json=excluded.raw_json, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, account_user_id);
+    try bindText(stmt, 2, folder_id);
+    if (getString(folder, "name")) |v| try bindText(stmt, 3, v) else _ = c.sqlite3_bind_null(stmt, 3);
+    try bindText(stmt, 4, raw);
+    try bindText(stmt, 5, now);
+    try bindText(stmt, 6, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, root: std.json.Value) !void {
+    const includes = getObject(root, "includes") orelse return;
+    if (getArray(includes, "media")) |media_arr| {
+        for (media_arr.items) |media| {
+            if (media != .object) continue;
+            const key = getString(media, "media_key") orelse "";
+            const width = getInt(media, "width");
+            const height = getInt(media, "height");
+            if (getString(media, "url")) |url| try downloadAsset(db, allocator, assets_dir, key, "image", url, width, height);
+            if (getString(media, "preview_image_url")) |url| try downloadAsset(db, allocator, assets_dir, key, "preview_image", url, width, height);
+            if (getArray(media, "variants")) |variants| {
+                if (selectVideoVariant(variants)) |url| {
+                    const kind = if (std.mem.eql(u8, getString(media, "type") orelse "", "animated_gif")) "animated_gif_variant" else "video_variant";
+                    try downloadAsset(db, allocator, assets_dir, key, kind, url, width, height);
+                } else if (variants.items.len > 0) {
+                    const source = try std.fmt.allocPrint(allocator, "x-bookmarks:media:{s}:variant", .{key});
+                    defer allocator.free(source);
+                    try recordSkippedMediaAssetOnce(db, allocator, key, "video_variant", source, width, height, "{\"reason\":\"no_mp4_variant\"}");
+                }
+            }
+        }
+    }
+    if (getArray(includes, "users")) |users_arr| {
+        for (users_arr.items) |user| {
+            if (user != .object) continue;
+            const user_id = getString(user, "id") orelse "";
+            if (getString(user, "profile_image_url")) |url| {
+                const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
+                defer allocator.free(key);
+                try downloadAsset(db, allocator, assets_dir, key, "author_avatar", url, null, null);
+            }
+        }
+    }
+}
+
+fn selectVideoVariant(variants: std.json.Array) ?[]const u8 {
+    const preview_max_bitrate = 2_500_000;
+    var best_preview_url: ?[]const u8 = null;
+    var best_preview_bitrate: i64 = -1;
+    var smallest_url: ?[]const u8 = null;
+    var smallest_bitrate: i64 = std.math.maxInt(i64);
+    for (variants.items) |variant| {
+        if (variant != .object) continue;
+        const content_type = getString(variant, "content_type") orelse "";
+        if (!std.mem.eql(u8, content_type, "video/mp4")) continue;
+        const url = getString(variant, "url") orelse continue;
+        const bitrate = getInt(variant, "bit_rate") orelse getInt(variant, "bitrate") orelse 0;
+        if (bitrate <= preview_max_bitrate and bitrate > best_preview_bitrate) {
+            best_preview_bitrate = bitrate;
+            best_preview_url = url;
+        }
+        if (bitrate < smallest_bitrate) {
+            smallest_bitrate = bitrate;
+            smallest_url = url;
+        }
+    }
+    return best_preview_url orelse smallest_url;
+}
+
+fn downloadAsset(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, media_key: []const u8, kind: []const u8, source_url: []const u8, width: ?i64, height: ?i64) !void {
+    if (try validAssetForSourceKeyKind(db, allocator, source_url, media_key, kind)) |existing| {
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: reuse existing {s} {s} bytes={}\n", .{ kind, media_key, existing.byte_size });
+        existing.deinit(allocator);
+        return;
+    }
+    if (try validAssetForSource(db, allocator, source_url)) |existing| {
+        defer existing.deinit(allocator);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: reuse content for {s} {s} bytes={}\n", .{ kind, media_key, existing.byte_size });
+        try recordMediaAsset(
+            db,
+            allocator,
+            media_key,
+            kind,
+            source_url,
+            existing.local_path,
+            if (existing.content_type.len > 0) existing.content_type else null,
+            existing.byte_size,
+            if (existing.sha256.len > 0) existing.sha256 else null,
+            width,
+            height,
+            "downloaded",
+            null,
+        );
+        return;
+    }
+    if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: downloading {s} {s}\n", .{ kind, media_key });
+    const response = httpFetch(allocator, .GET, source_url, null, &.{}) catch |err| {
+        const err_json = try errorJson(allocator, err);
+        defer allocator.free(err_json);
+        try recordMediaAsset(db, allocator, media_key, kind, source_url, "", null, 0, null, width, height, "failed", err_json);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: failed {s} {s}: {}\n", .{ kind, media_key, err });
+        return;
+    };
+    defer freeHttpResponse(allocator, response);
+    if (response.status != .ok) {
+        const err = try std.fmt.allocPrint(allocator, "{{\"http_status\":{}}}", .{@intFromEnum(response.status)});
+        defer allocator.free(err);
+        try recordMediaAsset(db, allocator, media_key, kind, source_url, "", response.content_type, 0, null, width, height, "failed", err);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: failed {s} {s} HTTP {}\n", .{ kind, media_key, @intFromEnum(response.status) });
+        return;
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(response.body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (try downloadedPathForHash(db, allocator, &hex)) |existing_path| {
+        defer allocator.free(existing_path);
+        try recordMediaAsset(db, allocator, media_key, kind, source_url, existing_path, response.content_type, @intCast(response.body.len), &hex, width, height, "downloaded", null);
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: reused hash for {s} {s} bytes={}\n", .{ kind, media_key, response.body.len });
+        return;
+    }
+    const ext = extensionForUrl(source_url);
+    const dir = try std.fs.path.join(allocator, &.{ assets_dir, kind, media_key });
+    defer allocator.free(dir);
+    try std.fs.cwd().makePath(dir);
+    const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ &hex, ext });
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    defer allocator.free(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = response.body });
+    try recordMediaAsset(db, allocator, media_key, kind, source_url, path, response.content_type, @intCast(response.body.len), &hex, width, height, "downloaded", null);
+    if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("assets: downloaded {s} {s} bytes={}\n", .{ kind, media_key, response.body.len });
+}
+
+fn assetSourceValid(db: *Db, allocator: std.mem.Allocator, source_url: []const u8) !bool {
+    const existing = try validAssetForSource(db, allocator, source_url) orelse return false;
+    existing.deinit(allocator);
+    return true;
+}
+
+fn validAssetForSourceKeyKind(db: *Db, allocator: std.mem.Allocator, source_url: []const u8, media_key: []const u8, kind: []const u8) !?ExistingAsset {
+    const stmt = try db.prepare("SELECT coalesce(media_key, ''), asset_kind, local_path, coalesce(content_type, ''), coalesce(byte_size, -1), coalesce(sha256, '') FROM media_assets WHERE source_url=? AND media_key=? AND asset_kind=? AND status='downloaded' AND local_path IS NOT NULL ORDER BY id DESC");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, source_url);
+    try bindText(stmt, 2, media_key);
+    try bindText(stmt, 3, kind);
+    return validAssetFromSteppedStatement(allocator, stmt);
+}
+
+fn validAssetForSource(db: *Db, allocator: std.mem.Allocator, source_url: []const u8) !?ExistingAsset {
+    const stmt = try db.prepare("SELECT coalesce(media_key, ''), asset_kind, local_path, coalesce(content_type, ''), coalesce(byte_size, -1), coalesce(sha256, '') FROM media_assets WHERE source_url=? AND status='downloaded' AND local_path IS NOT NULL ORDER BY id DESC");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, source_url);
+    return validAssetFromSteppedStatement(allocator, stmt);
+}
+
+fn validAssetFromSteppedStatement(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !?ExistingAsset {
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const path = colText(stmt, 2);
+        const expected_size = c.sqlite3_column_int64(stmt, 4);
+        const expected_hash = colText(stmt, 5);
+        if (!try assetFileMatches(allocator, path, expected_size, expected_hash)) continue;
+        return .{
+            .media_key = try allocator.dupe(u8, colText(stmt, 0)),
+            .asset_kind = try allocator.dupe(u8, colText(stmt, 1)),
+            .local_path = try allocator.dupe(u8, path),
+            .content_type = try allocator.dupe(u8, colText(stmt, 3)),
+            .byte_size = expected_size,
+            .sha256 = try allocator.dupe(u8, expected_hash),
+        };
+    }
+}
+
+fn downloadedPathForHash(db: *Db, allocator: std.mem.Allocator, sha256: []const u8) !?[]const u8 {
+    const stmt = try db.prepare("SELECT local_path, coalesce(byte_size, -1), coalesce(sha256, '') FROM media_assets WHERE sha256=? AND status='downloaded' AND local_path IS NOT NULL ORDER BY id ASC");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, sha256);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const path = colText(stmt, 0);
+        const expected_size = c.sqlite3_column_int64(stmt, 1);
+        const expected_hash = colText(stmt, 2);
+        if (!try assetFileMatches(allocator, path, expected_size, expected_hash)) continue;
+        return try allocator.dupe(u8, path);
+    }
+}
+
+fn assetFileMatches(allocator: std.mem.Allocator, path: []const u8, expected_size: i64, expected_hash: []const u8) !bool {
+    if (path.len == 0) return false;
+    const data = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 1024) catch return false;
+    defer allocator.free(data);
+    if (expected_size >= 0 and expected_size != @as(i64, @intCast(data.len))) return false;
+    if (expected_hash.len > 0) {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, expected_hash, &actual)) return false;
+    }
+    return true;
+}
+
+fn recordMediaAsset(db: *Db, allocator: std.mem.Allocator, media_key: []const u8, kind: []const u8, source_url: []const u8, local_path: []const u8, content_type: ?[]const u8, byte_size: i64, sha256: ?[]const u8, width: ?i64, height: ?i64, status: []const u8, err_json: ?[]const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        "INSERT INTO media_assets(media_key, asset_kind, source_url, local_path, content_type, byte_size, sha256, width, height, status, error_json, first_seen_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    if (media_key.len > 0) try bindText(stmt, 1, media_key) else _ = c.sqlite3_bind_null(stmt, 1);
+    try bindText(stmt, 2, kind);
+    try bindText(stmt, 3, source_url);
+    try bindText(stmt, 4, local_path);
+    if (content_type) |v| try bindText(stmt, 5, v) else _ = c.sqlite3_bind_null(stmt, 5);
+    _ = c.sqlite3_bind_int64(stmt, 6, byte_size);
+    if (sha256) |v| try bindText(stmt, 7, v) else _ = c.sqlite3_bind_null(stmt, 7);
+    if (width) |v| _ = c.sqlite3_bind_int64(stmt, 8, v) else _ = c.sqlite3_bind_null(stmt, 8);
+    if (height) |v| _ = c.sqlite3_bind_int64(stmt, 9, v) else _ = c.sqlite3_bind_null(stmt, 9);
+    try bindText(stmt, 10, status);
+    if (err_json) |v| try bindText(stmt, 11, v) else _ = c.sqlite3_bind_null(stmt, 11);
+    try bindText(stmt, 12, now);
+    try bindText(stmt, 13, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn recordSkippedMediaAssetOnce(db: *Db, allocator: std.mem.Allocator, media_key: []const u8, kind: []const u8, source_url: []const u8, width: ?i64, height: ?i64, err_json: []const u8) !void {
+    if (try mediaAssetRecordExists(db, media_key, kind, source_url, "skipped")) return;
+    try recordMediaAsset(db, allocator, media_key, kind, source_url, "", null, 0, null, width, height, "skipped", err_json);
+}
+
+fn mediaAssetRecordExists(db: *Db, media_key: []const u8, kind: []const u8, source_url: []const u8, status: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM media_assets WHERE media_key=? AND asset_kind=? AND source_url=? AND status=? LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, media_key);
+    try bindText(stmt, 2, kind);
+    try bindText(stmt, 3, source_url);
+    try bindText(stmt, 4, status);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn extensionForUrl(url: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+    const clean = url[0..end];
+    if (std.mem.endsWith(u8, clean, ".jpg") or std.mem.endsWith(u8, clean, ".jpeg")) return ".jpg";
+    if (std.mem.endsWith(u8, clean, ".png")) return ".png";
+    if (std.mem.endsWith(u8, clean, ".gif")) return ".gif";
+    if (std.mem.endsWith(u8, clean, ".webp")) return ".webp";
+    if (std.mem.endsWith(u8, clean, ".mp4")) return ".mp4";
+    return ".bin";
+}
+
+fn errorJson(allocator: std.mem.Allocator, err: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{{\"error\":\"{}\"}}", .{err});
+}
+
+fn jsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{f}", .{std.json.fmt(value, .{})});
+    return out.toOwnedSlice();
+}
+
+fn jsonStringAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{f}", .{std.json.fmt(value, .{})});
+    return out.toOwnedSlice();
+}
+
+fn optionalJsonStringAlloc(allocator: std.mem.Allocator, value: ?[]const u8) ![]u8 {
+    if (value) |v| return jsonStringAlloc(allocator, v);
+    return allocator.dupe(u8, "null");
+}
+
+fn nonEmptyOptional(value: ?[]const u8) ?[]const u8 {
+    if (value) |v| if (v.len > 0) return v;
+    return null;
+}
+
+fn exportJsonl(db: *Db, allocator: std.mem.Allocator, writer: anytype) !void {
+    const stmt = try db.prepare(
+        \\SELECT b.account_user_id, b.tweet_id, b.complete_for_offline_render, t.canonical_uri, t.twitter_uri,
+        \\       coalesce(t.text, ''), coalesce(t.created_at, ''), coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''), t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeAll("{");
+        try jsonField(w, "account_user_id", colText(stmt, 0), false);
+        try jsonField(w, "tweet_id", colText(stmt, 1), true);
+        try w.print(",\"complete_for_offline_render\":{}", .{c.sqlite3_column_int(stmt, 2) != 0});
+        try jsonField(w, "canonical_uri", colText(stmt, 3), true);
+        try jsonField(w, "twitter_uri", colText(stmt, 4), true);
+        try jsonField(w, "text", colText(stmt, 5), true);
+        try jsonField(w, "created_at", colText(stmt, 6), true);
+        try jsonField(w, "author_id", colText(stmt, 7), true);
+        try jsonField(w, "author_username", colText(stmt, 8), true);
+        try jsonField(w, "author_name", colText(stmt, 9), true);
+        try jsonAuthorAvatarPathField(db, w, colText(stmt, 7));
+        try jsonField(w, "raw_json", colText(stmt, 10), true);
+        try jsonStringArrayField(db, allocator, w, "local_asset_paths",
+            \\SELECT ma.local_path
+            \\FROM media_assets ma
+            \\JOIN tweet_media tm ON tm.media_key = ma.media_key
+            \\WHERE tm.tweet_id = ? AND ma.status = 'downloaded'
+            \\ORDER BY tm.position, ma.id
+        , colText(stmt, 1));
+        try jsonStringArrayField(db, allocator, w, "folder_ids", "SELECT folder_id FROM bookmark_folder_items WHERE tweet_id = ? ORDER BY folder_id", colText(stmt, 1));
+        try jsonFoldersField(db, w, colText(stmt, 1));
+        try jsonQuotePostsField(db, allocator, w, colText(stmt, 10));
+        try jsonMissingReferencesField(db, w, colText(stmt, 1));
+        try w.writeAll("}\n");
+        try writer.writeAll(buf.items);
+    }
+}
+
+fn jsonQuotePostsField(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_raw_json: []const u8) !void {
+    try writer.writeAll(",\"quote_posts\":[");
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tweet_raw_json, .{}) catch {
+        try writer.writeAll("]");
+        return;
+    };
+    defer parsed.deinit();
+    const refs = getArray(parsed.value, "referenced_tweets") orelse {
+        try writer.writeAll("]");
+        return;
+    };
+    var first = true;
+    for (refs.items) |ref| {
+        if (ref != .object) continue;
+        if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+        const quote_id = getString(ref, "id") orelse continue;
+        const stmt = try db.prepare(
+            \\SELECT tweet_id, canonical_uri, twitter_uri, coalesce(text, ''), coalesce(created_at, ''), coalesce(author_id, ''), raw_json
+            \\FROM tweets
+            \\WHERE tweet_id = ?
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, quote_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) continue;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{");
+        try jsonField(writer, "tweet_id", colText(stmt, 0), false);
+        try jsonField(writer, "canonical_uri", colText(stmt, 1), true);
+        try jsonField(writer, "twitter_uri", colText(stmt, 2), true);
+        try jsonField(writer, "text", colText(stmt, 3), true);
+        try jsonField(writer, "created_at", colText(stmt, 4), true);
+        try jsonField(writer, "author_id", colText(stmt, 5), true);
+        try jsonAuthorAvatarPathField(db, writer, colText(stmt, 5));
+        try jsonStringArrayField(db, allocator, writer, "local_asset_paths",
+            \\SELECT ma.local_path
+            \\FROM media_assets ma
+            \\JOIN tweet_media tm ON tm.media_key = ma.media_key
+            \\WHERE tm.tweet_id = ? AND ma.status = 'downloaded'
+            \\ORDER BY tm.position, ma.id
+        , quote_id);
+        try jsonField(writer, "raw_json", colText(stmt, 6), true);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+}
+
+fn jsonAuthorAvatarPathField(db: *Db, writer: anytype, author_id: []const u8) !void {
+    if (author_id.len == 0) {
+        try jsonField(writer, "author_avatar_path", "", true);
+        return;
+    }
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "user:{s}", .{author_id}) catch {
+        try jsonField(writer, "author_avatar_path", "", true);
+        return;
+    };
+    try jsonOptionalStringQueryField(db, writer, "author_avatar_path",
+        \\SELECT local_path
+        \\FROM media_assets
+        \\WHERE media_key=? AND asset_kind='author_avatar' AND status='downloaded'
+        \\ORDER BY id DESC
+        \\LIMIT 1
+    , key);
+}
+
+fn jsonOptionalStringQueryField(db: *Db, writer: anytype, name: []const u8, sql: []const u8, bind_value: []const u8) !void {
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, bind_value);
+    try writer.print(",{f}:", .{std.json.fmt(name, .{})});
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) {
+        try writer.print("{f}", .{std.json.fmt("", .{})});
+    } else if (rc == c.SQLITE_ROW) {
+        try writer.print("{f}", .{std.json.fmt(colText(stmt, 0), .{})});
+    } else {
+        return AppError.SqliteError;
+    }
+}
+
+fn jsonMissingReferencesField(db: *Db, writer: anytype, tweet_id: []const u8) !void {
+    try writer.writeAll(",\"missing_references\":[");
+    const stmt = try db.prepare(
+        \\SELECT referenced_tweet_id, reference_type, status, raw_json
+        \\FROM missing_references
+        \\WHERE tweet_id = ?
+        \\ORDER BY reference_type, referenced_tweet_id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{");
+        try jsonField(writer, "referenced_tweet_id", colText(stmt, 0), false);
+        try jsonField(writer, "reference_type", colText(stmt, 1), true);
+        try jsonField(writer, "status", colText(stmt, 2), true);
+        try jsonField(writer, "raw_json", colText(stmt, 3), true);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+}
+
+fn jsonFoldersField(db: *Db, writer: anytype, tweet_id: []const u8) !void {
+    try writer.writeAll(",\"folders\":[");
+    const stmt = try db.prepare(
+        \\SELECT f.folder_id, coalesce(f.name, ''), f.raw_json
+        \\FROM bookmark_folder_items bfi
+        \\JOIN bookmark_folders f ON f.account_user_id = bfi.account_user_id AND f.folder_id = bfi.folder_id
+        \\WHERE bfi.tweet_id = ?
+        \\ORDER BY f.name, f.folder_id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{");
+        try jsonField(writer, "folder_id", colText(stmt, 0), false);
+        try jsonField(writer, "name", colText(stmt, 1), true);
+        try jsonField(writer, "raw_json", colText(stmt, 2), true);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+}
+
+fn jsonStringArrayField(db: *Db, allocator: std.mem.Allocator, writer: anytype, name: []const u8, sql: []const u8, bind_value: []const u8) !void {
+    _ = allocator;
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, bind_value);
+    try writer.print(",{f}:[", .{std.json.fmt(name, .{})});
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{f}", .{std.json.fmt(colText(stmt, 0), .{})});
+    }
+    try writer.writeAll("]");
+}
+
+fn viewerExport(db: *Db, allocator: std.mem.Allocator, cfg: Config) !void {
+    try reconcileMissingDownloadedAssets(db, allocator);
+    try refreshCompletenessForAllActiveBookmarks(db, allocator);
+    try resetExportDir(allocator, cfg.export_dir);
+
+    const bookmarks_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "bookmarks.json" });
+    defer allocator.free(bookmarks_path);
+    const folders_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "folders.json" });
+    defer allocator.free(folders_path);
+    const media_assets_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "media-assets.json" });
+    defer allocator.free(media_assets_path);
+    const tweet_media_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "tweet-media.json" });
+    defer allocator.free(tweet_media_path);
+    const tweets_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "tweets.json" });
+    defer allocator.free(tweets_path);
+    const folder_items_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "folder-items.json" });
+    defer allocator.free(folder_items_path);
+    const missing_refs_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "missing-references.json" });
+    defer allocator.free(missing_refs_path);
+    const sync_warnings_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "sync-warnings.json" });
+    defer allocator.free(sync_warnings_path);
+    const summary_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "data", "sync-summary.json" });
+    defer allocator.free(summary_path);
+    const index_path = try std.fs.path.join(allocator, &.{ cfg.export_dir, "index.html" });
+    defer allocator.free(index_path);
+    try copyBuiltViewerIfPresent(allocator, cfg.export_dir);
+
+    try writeQueryJsonArray(db, allocator, bookmarks_path,
+        \\SELECT b.account_user_id, b.tweet_id, b.complete_for_offline_render, t.canonical_uri, t.twitter_uri,
+        \\       coalesce(t.text, ''), coalesce(t.created_at, ''), coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''),
+        \\       coalesce(u.profile_image_url, ''), t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    , &.{ "account_user_id", "tweet_id", "complete_for_offline_render:bool", "canonical_uri", "twitter_uri", "text", "created_at", "author_id", "author_username", "author_name", "author_avatar_url", "raw_json" });
+
+    try writeQueryJsonArray(db, allocator, folders_path, "SELECT account_user_id, folder_id, coalesce(name, ''), raw_json FROM bookmark_folders ORDER BY name, folder_id", &.{ "account_user_id", "folder_id", "name", "raw_json" });
+
+    try writeMediaAssetsJsonAndCopy(db, allocator, media_assets_path, cfg.export_dir);
+
+    try writeQueryJsonArray(db, allocator, tweet_media_path, "SELECT tweet_id, media_key, coalesce(position, 0) FROM tweet_media ORDER BY tweet_id, position", &.{ "tweet_id", "media_key", "position:int" });
+
+    try writeQueryJsonArray(db, allocator, tweets_path,
+        \\SELECT t.tweet_id, t.canonical_uri, t.twitter_uri, coalesce(t.text, ''), coalesce(t.created_at, ''),
+        \\       coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''), t.raw_json
+        \\FROM tweets t
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\ORDER BY t.created_at DESC, t.tweet_id DESC
+    , &.{ "tweet_id", "canonical_uri", "twitter_uri", "text", "created_at", "author_id", "author_username", "author_name", "raw_json" });
+
+    try writeQueryJsonArray(db, allocator, folder_items_path, "SELECT account_user_id, folder_id, tweet_id FROM bookmark_folder_items ORDER BY folder_id, tweet_id", &.{ "account_user_id", "folder_id", "tweet_id" });
+
+    try writeQueryJsonArray(db, allocator, missing_refs_path, "SELECT tweet_id, referenced_tweet_id, reference_type, status, raw_json FROM missing_references ORDER BY tweet_id, referenced_tweet_id", &.{ "tweet_id", "referenced_tweet_id", "reference_type", "status", "raw_json" });
+
+    try writeQueryJsonArray(db, allocator, sync_warnings_path, "SELECT sync_run_id, warning_type, context_json, created_at FROM sync_warnings ORDER BY id", &.{ "sync_run_id:int", "warning_type", "context_json", "created_at" });
+
+    try writeSummaryJson(db, allocator, summary_path);
+    if (!fileExists(index_path)) {
+        try std.fs.cwd().writeFile(.{ .sub_path = index_path, .data = fallbackViewerHtml });
+    }
+    try validateViewerExportFiles(allocator, cfg.export_dir);
+    try std.fs.File.stdout().deprecatedWriter().print("exported viewer: {s}\n", .{cfg.export_dir});
+}
+
+fn validateCompleteBookmarksForExport(db: *Db, allocator: std.mem.Allocator) !void {
+    const stmt = try db.prepare("SELECT account_user_id, tweet_id, last_seen_run_id FROM bookmark_items WHERE active = 1 AND complete_for_offline_render = 1 ORDER BY account_user_id, tweet_id");
+    defer _ = c.sqlite3_finalize(stmt);
+    var invalid: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const account_user_id = try allocator.dupe(u8, colText(stmt, 0));
+        defer allocator.free(account_user_id);
+        const tweet_id = try allocator.dupe(u8, colText(stmt, 1));
+        defer allocator.free(tweet_id);
+        const run_id = c.sqlite3_column_int64(stmt, 2);
+        if (!try bookmarkCompleteForOfflineRender(db, allocator, tweet_id) or !try folderStateAccountedForBookmarkRun(db, account_user_id, run_id)) {
+            invalid += 1;
+            if (!builtin.is_test) {
+                try std.fs.File.stderr().deprecatedWriter().print("complete bookmark no longer exportable: tweet_id={s}\n", .{tweet_id});
+            }
+        }
+    }
+    if (invalid > 0) return AppError.IoError;
+}
+
+fn refreshCompletenessForAllActiveBookmarks(db: *Db, allocator: std.mem.Allocator) !void {
+    const stmt = try db.prepare("SELECT account_user_id, tweet_id, last_seen_run_id FROM bookmark_items WHERE active = 1 ORDER BY account_user_id, tweet_id");
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const account_user_id = try allocator.dupe(u8, colText(stmt, 0));
+        defer allocator.free(account_user_id);
+        const tweet_id = try allocator.dupe(u8, colText(stmt, 1));
+        defer allocator.free(tweet_id);
+        const run_id = c.sqlite3_column_int64(stmt, 2);
+        const complete = try bookmarkCompleteForOfflineRender(db, allocator, tweet_id) and try folderStateAccountedForBookmarkRun(db, account_user_id, run_id);
+        try updateBookmarkCompleteness(db, account_user_id, tweet_id, complete);
+    }
+}
+
+fn reconcileMissingDownloadedAssets(db: *Db, allocator: std.mem.Allocator) !void {
+    const stmt = try db.prepare("SELECT id, local_path, coalesce(byte_size, -1), coalesce(sha256, ''), status FROM media_assets WHERE status IN ('downloaded', 'ok') ORDER BY id");
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const path = try allocator.dupe(u8, colText(stmt, 1));
+        defer allocator.free(path);
+        const expected_size = c.sqlite3_column_int64(stmt, 2);
+        const expected_hash = try allocator.dupe(u8, colText(stmt, 3));
+        defer allocator.free(expected_hash);
+        if (try assetFileMatches(allocator, path, expected_size, expected_hash)) continue;
+        try markMediaAssetFailed(db, allocator, id, "{\"error\":\"local_asset_missing_or_invalid\"}");
+        if (!builtin.is_test) try std.fs.File.stderr().deprecatedWriter().print("warning: marked missing/invalid local asset failed id={} path={s}\n", .{ id, path });
+    }
+}
+
+fn markMediaAssetFailed(db: *Db, allocator: std.mem.Allocator, id: i64, error_json: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare("UPDATE media_assets SET status='failed', error_json=?, last_checked_at=? WHERE id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, error_json);
+    try bindText(stmt, 2, now);
+    _ = c.sqlite3_bind_int64(stmt, 3, id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn folderStateAccountedForBookmarkRun(db: *Db, account_user_id: []const u8, run_id: i64) !bool {
+    const stmt = try db.prepare(
+        \\SELECT 1
+        \\FROM sync_runs
+        \\WHERE id=? AND account_user_id=? AND status='succeeded'
+        \\  AND NOT EXISTS (
+        \\    SELECT 1
+        \\    FROM sync_warnings
+        \\    WHERE sync_run_id=sync_runs.id
+        \\      AND warning_type IN ('bookmark_folder_sync_failed', 'bookmark_folder_item_sync_failed')
+        \\  )
+        \\LIMIT 1
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, run_id);
+    try bindText(stmt, 2, account_user_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn resetExportDir(allocator: std.mem.Allocator, export_dir: []const u8) !void {
+    if (fileExists(export_dir)) {
+        try std.fs.cwd().deleteTree(export_dir);
+    }
+    try std.fs.cwd().makePath(export_dir);
+    const data_dir = try std.fs.path.join(allocator, &.{ export_dir, "data" });
+    defer allocator.free(data_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ export_dir, "assets" });
+    defer allocator.free(assets_dir);
+    const static_dir = try std.fs.path.join(allocator, &.{ export_dir, "static" });
+    defer allocator.free(static_dir);
+    try std.fs.cwd().makePath(data_dir);
+    try std.fs.cwd().makePath(assets_dir);
+    try std.fs.cwd().makePath(static_dir);
+}
+
+fn copyBuiltViewerIfPresent(allocator: std.mem.Allocator, export_dir: []const u8) !void {
+    if (!fileExists("viewer/dist/index.html")) return;
+    const index_text = try std.fs.cwd().readFileAlloc(allocator, "viewer/dist/index.html", 1024 * 1024);
+    defer allocator.free(index_text);
+    const dest_index = try std.fs.path.join(allocator, &.{ export_dir, "index.html" });
+    defer allocator.free(dest_index);
+    try ensureParentDir(dest_index);
+    try std.fs.cwd().copyFile("viewer/dist/index.html", std.fs.cwd(), dest_index, .{});
+
+    var assets = std.fs.cwd().openDir("viewer/dist/assets", .{ .iterate = true }) catch return;
+    defer assets.close();
+    var iterator = assets.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, index_text, entry.name) == null) continue;
+        const src_path = try std.fs.path.join(allocator, &.{ "viewer/dist/assets", entry.name });
+        defer allocator.free(src_path);
+        const dest_path = try std.fs.path.join(allocator, &.{ export_dir, "assets", entry.name });
+        defer allocator.free(dest_path);
+        try ensureParentDir(dest_path);
+        try std.fs.cwd().copyFile(src_path, std.fs.cwd(), dest_path, .{});
+    }
+}
+
+fn copyDirRecursive(allocator: std.mem.Allocator, src_dir: std.fs.Dir, src_root: []const u8, dest_root: []const u8) !void {
+    var iterator = src_dir.iterate();
+    while (try iterator.next()) |entry| {
+        const src_path = try std.fs.path.join(allocator, &.{ src_root, entry.name });
+        defer allocator.free(src_path);
+        const dest_path = try std.fs.path.join(allocator, &.{ dest_root, entry.name });
+        defer allocator.free(dest_path);
+        switch (entry.kind) {
+            .file => {
+                try ensureParentDir(dest_path);
+                try std.fs.cwd().copyFile(src_path, std.fs.cwd(), dest_path, .{});
+            },
+            .directory => {
+                try std.fs.cwd().makePath(dest_path);
+                var child = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+                defer child.close();
+                try copyDirRecursive(allocator, child, src_path, dest_path);
+            },
+            else => {},
+        }
+    }
+}
+
+fn writeQueryJsonArray(db: *Db, allocator: std.mem.Allocator, path: []const u8, sql: []const u8, fields: []const []const u8) !void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.writeAll("[\n");
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (!first) try w.writeAll(",\n");
+        first = false;
+        try w.writeAll("  {");
+        for (fields, 0..) |field_spec, idx| {
+            const split = std.mem.indexOfScalar(u8, field_spec, ':');
+            const name = if (split) |s| field_spec[0..s] else field_spec;
+            const typ = if (split) |s| field_spec[s + 1 ..] else "text";
+            if (idx > 0) try w.writeAll(",");
+            try w.print("{f}:", .{std.json.fmt(name, .{})});
+            if (std.mem.eql(u8, typ, "bool")) {
+                try w.print("{}", .{c.sqlite3_column_int(stmt, @intCast(idx)) != 0});
+            } else if (std.mem.eql(u8, typ, "int")) {
+                try w.print("{}", .{c.sqlite3_column_int64(stmt, @intCast(idx))});
+            } else {
+                try w.print("{f}", .{std.json.fmt(colText(stmt, @intCast(idx)), .{})});
+            }
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("\n]\n");
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+}
+
+fn writeMediaAssetsJsonAndCopy(db: *Db, allocator: std.mem.Allocator, path: []const u8, export_dir: []const u8) !void {
+    const export_assets_dir = try std.fs.path.join(allocator, &.{ export_dir, "assets", "media-assets" });
+    defer allocator.free(export_assets_dir);
+    try std.fs.cwd().makePath(export_assets_dir);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.writeAll("[\n");
+    const stmt = try db.prepare(
+        "SELECT id, coalesce(media_key, ''), asset_kind, source_url, local_path, coalesce(content_type, ''), coalesce(byte_size, 0), coalesce(sha256, ''), coalesce(width, 0), coalesce(height, 0), status, coalesce(error_json, '') FROM media_assets ORDER BY id",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const local_path = colText(stmt, 4);
+        const status = colText(stmt, 10);
+        var viewer_path: []const u8 = "";
+        if (std.mem.eql(u8, status, "downloaded") and local_path.len > 0) {
+            const base = std.fs.path.basename(local_path);
+            const rel = try std.fmt.allocPrint(allocator, "assets/media-assets/{}-{s}", .{ id, base });
+            defer allocator.free(rel);
+            const dest = try std.fs.path.join(allocator, &.{ export_dir, rel });
+            defer allocator.free(dest);
+            if (std.fs.cwd().readFileAlloc(allocator, local_path, 1024 * 1024 * 1024)) |data| {
+                defer allocator.free(data);
+                try ensureParentDir(dest);
+                try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = data });
+                viewer_path = try allocator.dupe(u8, rel);
+            } else |_| {}
+        }
+        defer if (viewer_path.len > 0) allocator.free(viewer_path);
+        if (!first) try w.writeAll(",\n");
+        first = false;
+        try w.writeAll("  {");
+        try w.print("{f}:{}", .{ std.json.fmt("id", .{}), id });
+        try jsonField(w, "media_key", colText(stmt, 1), true);
+        try jsonField(w, "asset_kind", colText(stmt, 2), true);
+        try jsonField(w, "source_url", colText(stmt, 3), true);
+        try jsonField(w, "local_path", local_path, true);
+        try jsonField(w, "viewer_path", viewer_path, true);
+        try jsonField(w, "content_type", colText(stmt, 5), true);
+        try w.print(",{f}:{}", .{ std.json.fmt("byte_size", .{}), c.sqlite3_column_int64(stmt, 6) });
+        try jsonField(w, "sha256", colText(stmt, 7), true);
+        try w.print(",{f}:{}", .{ std.json.fmt("width", .{}), c.sqlite3_column_int64(stmt, 8) });
+        try w.print(",{f}:{}", .{ std.json.fmt("height", .{}), c.sqlite3_column_int64(stmt, 9) });
+        try jsonField(w, "status", status, true);
+        try jsonField(w, "error_json", colText(stmt, 11), true);
+        try w.writeAll("}");
+    }
+    try w.writeAll("\n]\n");
+    try ensureParentDir(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+}
+
+fn writeSummaryJson(db: *Db, allocator: std.mem.Allocator, path: []const u8) !void {
+    const generated = try timestampString(allocator);
+    defer allocator.free(generated);
+    const total = try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1");
+    const new_bookmarks = try scalarCount(db, "SELECT coalesce((SELECT new_bookmarks FROM sync_runs WHERE status = 'succeeded' ORDER BY id DESC LIMIT 1), 0)");
+    const complete = try scalarCount(db, "SELECT count(*) FROM bookmark_items WHERE active = 1 AND complete_for_offline_render = 1");
+    const failed = try scalarCount(db, "SELECT count(*) FROM media_assets WHERE status = 'failed'");
+    const skipped = try scalarCount(db, "SELECT count(*) FROM media_assets WHERE status = 'skipped'");
+    const folders = try scalarCount(db, "SELECT count(*) FROM bookmark_folders");
+    const quote_posts = try countStoredQuotePosts(db, allocator);
+    const sync_warnings = try scalarCount(db, "SELECT count(*) FROM sync_warnings");
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"generated_at\": \"{s}\",\n  \"total_bookmarks\": {},\n  \"new_bookmarks\": {},\n  \"complete_bookmarks\": {},\n  \"incomplete_bookmarks\": {},\n  \"failed_media_assets\": {},\n  \"skipped_media_assets\": {},\n  \"folders\": {},\n  \"quote_posts\": {},\n  \"sync_warnings\": {}\n}}\n",
+        .{ generated, total, new_bookmarks, complete, total - complete, failed, skipped, folders, quote_posts, sync_warnings },
+    );
+    defer allocator.free(json);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = json });
+}
+
+fn countStoredQuotePosts(db: *Db, allocator: std.mem.Allocator) !i64 {
+    const stmt = try db.prepare("SELECT raw_json FROM tweets WHERE raw_json LIKE '%\"referenced_tweets\"%' ORDER BY tweet_id");
+    defer _ = c.sqlite3_finalize(stmt);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        seen.deinit();
+    }
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(stmt, 0), .{}) catch continue;
+        defer parsed.deinit();
+        const refs = getArray(parsed.value, "referenced_tweets") orelse continue;
+        for (refs.items) |ref| {
+            if (ref != .object) continue;
+            if (!std.mem.eql(u8, getString(ref, "type") orelse "", "quoted")) continue;
+            const quote_id = getString(ref, "id") orelse continue;
+            if (!try tweetExists(db, quote_id)) continue;
+            if (!seen.contains(quote_id)) try seen.put(try allocator.dupe(u8, quote_id), {});
+        }
+    }
+    return @intCast(seen.count());
+}
+
+fn scalarCount(db: *Db, sql: []const u8) !i64 {
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return AppError.SqliteError;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn assetsVerify(db: *Db, allocator: std.mem.Allocator) !void {
+    const stmt = try db.prepare("SELECT id, local_path, coalesce(byte_size, -1), coalesce(sha256, ''), status FROM media_assets WHERE status IN ('downloaded', 'ok')");
+    defer _ = c.sqlite3_finalize(stmt);
+    var checked: u32 = 0;
+    var failed: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        checked += 1;
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const path = colText(stmt, 1);
+        const expected_size = c.sqlite3_column_int64(stmt, 2);
+        const expected_hash = colText(stmt, 3);
+        const data = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 1024) catch {
+            failed += 1;
+            try std.fs.File.stderr().deprecatedWriter().print("missing asset id={} path={s}\n", .{ id, path });
+            continue;
+        };
+        defer allocator.free(data);
+        if (expected_size >= 0 and expected_size != @as(i64, @intCast(data.len))) {
+            failed += 1;
+            try std.fs.File.stderr().deprecatedWriter().print("size mismatch asset id={} path={s}\n", .{ id, path });
+        }
+        if (expected_hash.len > 0) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+            const actual = std.fmt.bytesToHex(digest, .lower);
+            if (!std.mem.eql(u8, expected_hash, &actual)) {
+                failed += 1;
+                try std.fs.File.stderr().deprecatedWriter().print("hash mismatch asset id={} path={s}\n", .{ id, path });
+            }
+        }
+    }
+    try std.fs.File.stdout().deprecatedWriter().print("assets checked: {}\nasset failures: {}\n", .{ checked, failed });
+    if (failed > 0) return AppError.IoError;
+}
+
+fn serveDirectory(allocator: std.mem.Allocator, root: []const u8, port: u16) !void {
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    var server = try address.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    try std.fs.File.stdout().deprecatedWriter().print("serving {s} at http://127.0.0.1:{}/\n", .{ root, port });
+    while (true) {
+        var conn = try server.accept();
+        defer conn.stream.close();
+        var buf: [4096]u8 = undefined;
+        const n = try conn.stream.read(&buf);
+        if (n == 0) continue;
+        const req = buf[0..n];
+        const method = parseHttpMethod(req) orelse {
+            try conn.stream.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            continue;
+        };
+        if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) {
+            try conn.stream.writeAll("HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n");
+            continue;
+        }
+        const path = parseHttpPath(req) orelse {
+            try conn.stream.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            continue;
+        };
+        const safe_path = if (std.mem.eql(u8, path, "/")) "/index.html" else path;
+        if (std.mem.indexOf(u8, safe_path, "..") != null) {
+            try conn.stream.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            continue;
+        }
+        const rel = std.mem.trimLeft(u8, safe_path, "/");
+        const full = try std.fs.path.join(allocator, &.{ root, rel });
+        defer allocator.free(full);
+        var file = std.fs.cwd().openFile(full, .{}) catch {
+            try conn.stream.writeAll("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            continue;
+        };
+        defer file.close();
+        const file_size = try file.getEndPos();
+        const ctype = contentType(full);
+        const range = parseRangeHeader(req, file_size) catch {
+            const header = try std.fmt.allocPrint(allocator, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{file_size});
+            defer allocator.free(header);
+            try conn.stream.writeAll(header);
+            continue;
+        };
+        const header = if (range) |r|
+            try std.fmt.allocPrint(allocator, "HTTP/1.1 206 Partial Content\r\nContent-Type: {s}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ ctype, r.start, r.end, file_size, r.end - r.start + 1 })
+        else
+            try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ ctype, file_size });
+        defer allocator.free(header);
+        try conn.stream.writeAll(header);
+        if (std.mem.eql(u8, method, "GET")) {
+            if (range) |r| {
+                try writeFileRange(&conn.stream, &file, r.start, r.end - r.start + 1);
+            } else {
+                try writeFileRange(&conn.stream, &file, 0, file_size);
+            }
+        }
+    }
+}
+
+fn parseHttpMethod(req: []const u8) ?[]const u8 {
+    const end = std.mem.indexOfScalar(u8, req, ' ') orelse return null;
+    return req[0..end];
+}
+
+fn parseHttpPath(req: []const u8) ?[]const u8 {
+    const method_end = std.mem.indexOfScalar(u8, req, ' ') orelse return null;
+    const method = req[0..method_end];
+    if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) return null;
+    const rest = req[method_end + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    const target = rest[0..end];
+    const query = std.mem.indexOfAny(u8, target, "?#") orelse target.len;
+    return target[0..query];
+}
+
+const ByteRange = struct {
+    start: u64,
+    end: u64,
+};
+
+fn parseRangeHeader(req: []const u8, file_size: u64) !?ByteRange {
+    const value = headerValue(req, "range") orelse return null;
+    if (file_size == 0) return error.InvalidRange;
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "bytes=")) return error.InvalidRange;
+    const spec = trimmed["bytes=".len..];
+    if (std.mem.indexOfScalar(u8, spec, ',') != null) return error.InvalidRange;
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.InvalidRange;
+    const start_text = std.mem.trim(u8, spec[0..dash], " \t");
+    const end_text = std.mem.trim(u8, spec[dash + 1 ..], " \t");
+    if (start_text.len == 0) {
+        if (end_text.len == 0) return error.InvalidRange;
+        const suffix_len = try std.fmt.parseInt(u64, end_text, 10);
+        if (suffix_len == 0) return error.InvalidRange;
+        const actual_len = @min(suffix_len, file_size);
+        return .{ .start = file_size - actual_len, .end = file_size - 1 };
+    }
+    const start = try std.fmt.parseInt(u64, start_text, 10);
+    if (start >= file_size) return error.InvalidRange;
+    const requested_end = if (end_text.len == 0) file_size - 1 else try std.fmt.parseInt(u64, end_text, 10);
+    if (requested_end < start) return error.InvalidRange;
+    return .{ .start = start, .end = @min(requested_end, file_size - 1) };
+}
+
+fn headerValue(req: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, req, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) return null;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn writeFileRange(stream: anytype, file: *std.fs.File, start: u64, len: u64) !void {
+    try file.seekTo(start);
+    var remaining = len;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (remaining > 0) {
+        const chunk = @min(remaining, @as(u64, buffer.len));
+        const n = try file.read(buffer[0..@intCast(chunk)]);
+        if (n == 0) break;
+        try stream.writeAll(buffer[0..n]);
+        remaining -= n;
+    }
+}
+
+fn contentType(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    if (std.mem.endsWith(u8, path, ".mp4")) return "video/mp4";
+    return "application/octet-stream";
+}
+
+fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, value: []const u8) !void {
+    if (c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), null) != c.SQLITE_OK) return AppError.SqliteError;
+}
+
+fn colText(stmt: *c.sqlite3_stmt, idx: c_int) []const u8 {
+    const ptr = c.sqlite3_column_text(stmt, idx) orelse return "";
+    return std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
+}
+
+fn getObject(v: std.json.Value, key: []const u8) ?std.json.Value {
+    if (v != .object) return null;
+    return v.object.get(key);
+}
+
+fn getArray(v: std.json.Value, key: []const u8) ?std.json.Array {
+    const x = getObject(v, key) orelse return null;
+    if (x != .array) return null;
+    return x.array;
+}
+
+fn getString(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const x = getObject(v, key) orelse return null;
+    if (x != .string) return null;
+    return x.string;
+}
+
+fn getNullableString(v: std.json.Value, key: []const u8) ??[]const u8 {
+    const x = getObject(v, key) orelse return null;
+    if (x == .null) return null;
+    if (x == .string) return x.string;
+    return null;
+}
+
+fn getBool(v: std.json.Value, key: []const u8) ?bool {
+    const x = getObject(v, key) orelse return null;
+    if (x != .bool) return null;
+    return x.bool;
+}
+
+fn getInt(v: std.json.Value, key: []const u8) ?i64 {
+    const x = getObject(v, key) orelse return null;
+    return switch (x) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+
+fn parseScopes(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
+    var scopes = try allocator.alloc([]const u8, arr.items.len);
+    for (arr.items, 0..) |item, idx| {
+        if (item != .string) return AppError.ConfigInvalid;
+        scopes[idx] = try allocator.dupe(u8, item.string);
+    }
+    return scopes;
+}
+
+fn cloneScopes(allocator: std.mem.Allocator, scopes: []const []const u8) ![]const []const u8 {
+    var out = try allocator.alloc([]const u8, scopes.len);
+    for (scopes, 0..) |s, i| out[i] = try allocator.dupe(u8, s);
+    return out;
+}
+
+fn joinScopes(allocator: std.mem.Allocator, scopes: []const []const u8, sep: []const u8) ![]const u8 {
+    var list = std.ArrayList(u8).empty;
+    for (scopes, 0..) |scope, i| {
+        if (i > 0) try list.appendSlice(allocator, sep);
+        try list.appendSlice(allocator, scope);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn makePkceVerifier(allocator: std.mem.Allocator) ![]const u8 {
+    var bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    const size = std.base64.url_safe_no_pad.Encoder.calcSize(bytes.len);
+    const out = try allocator.alloc(u8, size);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, &bytes);
+    return out;
+}
+
+fn makePkceChallenge(allocator: std.mem.Allocator, verifier: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+    const size = std.base64.url_safe_no_pad.Encoder.calcSize(digest.len);
+    const out = try allocator.alloc(u8, size);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, &digest);
+    return out;
+}
+
+fn buildAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, redirect_uri: []const u8, scopes: []const u8, state: []const u8, challenge: []const u8) ![]const u8 {
+    const cid = try urlEncode(allocator, client_id);
+    defer allocator.free(cid);
+    const redir = try urlEncode(allocator, redirect_uri);
+    defer allocator.free(redir);
+    const scope = try urlEncode(allocator, scopes);
+    defer allocator.free(scope);
+    const st = try urlEncode(allocator, state);
+    defer allocator.free(st);
+    const ch = try urlEncode(allocator, challenge);
+    defer allocator.free(ch);
+    return std.fmt.allocPrint(allocator, "https://x.com/i/oauth2/authorize?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&state={s}&code_challenge={s}&code_challenge_method=S256", .{ cid, redir, scope, st, ch });
+}
+
+fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    for (input) |ch| {
+        if ((ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
+            try out.append(allocator, ch);
+        } else if (ch == ' ') {
+            try out.appendSlice(allocator, "%20");
+        } else {
+            try out.writer(allocator).print("%{X:0>2}", .{ch});
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn codeFromCallbackUrl(allocator: std.mem.Allocator, callback_url: []const u8) ![]const u8 {
+    return callbackParamFromUrl(allocator, callback_url, "code");
+}
+
+fn callbackParamFromUrl(allocator: std.mem.Allocator, callback_url: []const u8, name: []const u8) ![]const u8 {
+    const query_start = if (std.mem.indexOfScalar(u8, callback_url, '?')) |idx| idx + 1 else 0;
+    const fragment_start = std.mem.indexOfScalarPos(u8, callback_url, query_start, '#') orelse callback_url.len;
+    var parts = std.mem.splitScalar(u8, callback_url[query_start..fragment_start], '&');
+    while (parts.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const key = try urlDecode(allocator, part[0..eq]);
+        defer allocator.free(key);
+        if (!std.mem.eql(u8, key, name)) continue;
+        return urlDecode(allocator, part[eq + 1 ..]);
+    }
+    return AppError.InvalidArguments;
+}
+
+fn validateCallbackState(pending: std.json.Value, actual_state: []const u8) !void {
+    const expected_state = getString(pending, "state") orelse return AppError.AuthRequired;
+    if (!std.mem.eql(u8, expected_state, actual_state)) return AppError.AuthRequired;
+}
+
+fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const byte = try std.fmt.parseInt(u8, input[i + 1 .. i + 3], 16);
+            try out.append(allocator, byte);
+            i += 3;
+        } else if (input[i] == '+') {
+            try out.append(allocator, ' ');
+            i += 1;
+        } else {
+            try out.append(allocator, input[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn jsonField(writer: anytype, name: []const u8, value: []const u8, comma: bool) !void {
+    if (comma) try writer.writeAll(",");
+    try writer.print("{f}:{f}", .{ std.json.fmt(name, .{}), std.json.fmt(value, .{}) });
+}
+
+fn fileExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn ensureParentDir(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
+}
+
+fn getHome(allocator: std.mem.Allocator) ![]const u8 {
+    return std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => AppError.MissingHome,
+        else => err,
+    };
+}
+
+fn absolutize(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    return std.fs.cwd().realpathAlloc(allocator, path) catch {
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+        return std.fs.path.join(allocator, &.{ cwd, path });
+    };
+}
+
+fn dirnameDup(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.dirname(path)) |dir| return allocator.dupe(u8, dir);
+    return allocator.dupe(u8, ".");
+}
+
+fn timestampString(allocator: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{}", .{std.time.timestamp()});
+}
+
+fn uniqueRunDirectoryName(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    var random_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    const hex = std.fmt.bytesToHex(random_bytes, .lower);
+    return std.fmt.allocPrint(allocator, "{s}-{}-{s}", .{ prefix, std.time.timestamp(), &hex });
+}
+
+fn replaceOwned(allocator: std.mem.Allocator, original: []u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const replaced = try std.mem.replaceOwned(u8, allocator, original, needle, replacement);
+    allocator.free(original);
+    return replaced;
+}
+
+fn writePrivateFile(path: []const u8, data: []const u8) !void {
+    try ensureParentDir(path);
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
+    defer file.close();
+    if (builtin.os.tag != .windows) try file.chmod(0o600);
+    try file.writeAll(data);
+}
+
+const fallbackViewerHtml =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>x-bookmarks viewer</title>
+    \\  <style>
+    \\    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    \\    body { margin: 0; background: #f7f8fa; color: #0f1419; }
+    \\    header { position: sticky; top: 0; z-index: 2; background: rgba(255,255,255,.94); border-bottom: 1px solid #d8dde3; padding: 12px 20px; display: flex; gap: 12px; align-items: center; }
+    \\    h1 { font-size: 18px; margin: 0; }
+    \\    main { max-width: 760px; margin: 0 auto; padding: 16px; }
+    \\    .filters { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    \\    input, select { border: 1px solid #c8d0d8; border-radius: 6px; padding: 8px 10px; background: #fff; color: inherit; }
+    \\    article { background: #fff; border: 1px solid #d8dde3; border-radius: 8px; padding: 14px 16px; margin: 12px 0; }
+    \\    .byline { display: flex; gap: 8px; align-items: baseline; font-weight: 700; }
+    \\    .muted { color: #536471; font-weight: 400; }
+    \\    .text { white-space: pre-wrap; line-height: 1.45; margin: 10px 0; }
+    \\    .links { display: flex; flex-wrap: wrap; gap: 10px; font-size: 14px; }
+    \\    a { color: #0f6cbd; text-decoration: none; }
+    \\    .badge { border: 1px solid #c8d0d8; border-radius: 999px; padding: 2px 8px; font-size: 12px; }
+    \\    pre { max-height: 240px; overflow: auto; background: #f1f3f5; padding: 10px; border-radius: 6px; }
+    \\    @media (prefers-color-scheme: dark) {
+    \\      body { background: #101214; color: #edf1f5; }
+    \\      header, article { background: #171a1d; border-color: #30363d; }
+    \\      input, select { background: #101214; border-color: #30363d; }
+    \\      .muted { color: #98a6b3; }
+    \\      pre { background: #101214; }
+    \\    }
+    \\  </style>
+    \\</head>
+    \\<body>
+    \\  <header>
+    \\    <h1>x-bookmarks</h1>
+    \\    <div class="filters">
+    \\      <input id="q" type="search" placeholder="Search">
+    \\      <select id="complete">
+    \\        <option value="all">All</option>
+    \\        <option value="complete">Complete</option>
+    \\        <option value="incomplete">Incomplete</option>
+    \\      </select>
+    \\    </div>
+    \\  </header>
+    \\  <main id="app"></main>
+    \\  <script>
+    \\    const app = document.getElementById('app');
+    \\    const q = document.getElementById('q');
+    \\    const complete = document.getElementById('complete');
+    \\    let bookmarks = [];
+    \\    function esc(s){return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+    \\    function fullText(b){try{const raw=JSON.parse(b.raw_json||'{}');return raw.note_tweet?.text || raw.text || b.text || '';}catch{return b.text || '';}}
+    \\    function render(){
+    \\      const query = q.value.toLowerCase();
+    \\      const mode = complete.value;
+    \\      const rows = bookmarks.filter(b => (!query || fullText(b).toLowerCase().includes(query) || (b.author_username || '').toLowerCase().includes(query)) && (mode === 'all' || (mode === 'complete') === !!b.complete_for_offline_render));
+    \\      app.innerHTML = rows.map(b => `<article>
+    \\        <div class="byline"><span>${esc(b.author_name || b.author_username || 'Unknown author')}</span><span class="muted">@${esc(b.author_username || 'unknown')}</span><span class="badge">${b.complete_for_offline_render ? 'complete' : 'incomplete'}</span></div>
+    \\        <div class="muted">${esc(b.created_at || '')}</div>
+    \\        <div class="text">${esc(fullText(b))}</div>
+    \\        <div class="links"><a href="${esc(b.canonical_uri)}">X URI</a><a href="${esc(b.twitter_uri)}">Twitter URI</a></div>
+    \\        <details><summary>Raw JSON</summary><pre>${esc(b.raw_json || '')}</pre></details>
+    \\      </article>`).join('') || '<p class="muted">No bookmarks exported.</p>';
+    \\    }
+    \\    fetch('./data/bookmarks.json').then(r=>r.json()).then(data=>{bookmarks=data;render();}).catch(()=>{app.innerHTML='<p class="muted">No export data found.</p>';});
+    \\    q.addEventListener('input', render);
+    \\    complete.addEventListener('change', render);
+    \\  </script>
+    \\</body>
+    \\</html>
+;
+
+test "PKCE challenge has URL-safe base64 shape" {
+    const allocator = std.testing.allocator;
+    const challenge = try makePkceChallenge(allocator, "abc");
+    defer allocator.free(challenge);
+    try std.testing.expectEqualStrings("ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", challenge);
+}
+
+test "URL encoding uses RFC3986 spaces" {
+    const allocator = std.testing.allocator;
+    const out = try urlEncode(allocator, "a b/c?");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("a%20b%2Fc%3F", out);
+}
+
+test "home override resolves config and state paths under the selected directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const paths = try resolvePaths(allocator, null, home);
+
+    try std.testing.expect(std.mem.endsWith(u8, paths.config_path, "/config.json"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.config_dir, &tmp.sub_path));
+    try std.testing.expect(std.mem.endsWith(u8, paths.state_dir, &tmp.sub_path));
+
+    const cfg = try Config.default(allocator, paths, home);
+    try std.testing.expect(std.mem.endsWith(u8, cfg.database_path, "/x_bookmarks.sqlite"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.token_path, "/oauth-token.json"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.assets_dir, "/assets"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.export_dir, "/viewer-export"));
+}
+
+test "config parser resolves relative paths against home override" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const config_path = try std.fs.path.join(allocator, &.{ home, "config.json" });
+    const config_json =
+        \\{
+        \\  "x": {
+        \\    "client_id": "abc",
+        \\    "client_secret": null,
+        \\    "redirect_uri": "http://127.0.0.1:8765/callback",
+        \\    "scopes": ["tweet.read", "users.read", "bookmark.read", "offline.access"]
+        \\  },
+        \\  "storage": {
+        \\    "database_path": "db.sqlite",
+        \\    "token_path": "token.json",
+        \\    "assets_dir": "assets-local"
+        \\  },
+        \\  "sync": {
+        \\    "max_results": 42,
+        \\    "require_approval": false
+        \\  },
+        \\  "viewer": {
+        \\    "export_dir": "viewer-local"
+        \\  }
+        \\}
+    ;
+    try std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = config_json });
+
+    const paths = try resolvePaths(allocator, null, home);
+    const cfg = try loadConfig(allocator, paths, home);
+    try validateConfig(cfg);
+    try std.testing.expectEqualStrings("abc", cfg.client_id);
+    try std.testing.expectEqual(@as(u32, 42), cfg.max_results);
+    try std.testing.expect(!cfg.require_approval);
+    try std.testing.expect(std.mem.endsWith(u8, cfg.database_path, "/db.sqlite"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.token_path, "/token.json"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.assets_dir, "/assets-local"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.export_dir, "/viewer-local"));
+}
+
+test "config parser rejects negative numeric config values without trapping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const config_path = try std.fs.path.join(allocator, &.{ home, "config.json" });
+    const config_json =
+        \\{
+        \\  "x": {"client_id": "abc", "redirect_uri": "http://127.0.0.1:8765/callback", "scopes": ["tweet.read", "users.read", "bookmark.read", "offline.access"]},
+        \\  "sync": {"max_results": -1}
+        \\}
+    ;
+    try std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = config_json });
+
+    const paths = try resolvePaths(allocator, null, home);
+    try std.testing.expectError(AppError.ConfigInvalid, loadConfig(allocator, paths, home));
+}
+
+test "config init substitutions are JSON escaped" {
+    const allocator = std.testing.allocator;
+    var text = try allocator.dupe(u8,
+        \\{"x":{"client_id":"your-client-id","redirect_uri":"http://127.0.0.1:8765/callback"}}
+    );
+    const client_json = try jsonStringAlloc(allocator, "client\"with\\chars");
+    defer allocator.free(client_json);
+    text = try replaceOwned(allocator, text, "\"your-client-id\"", client_json);
+    const redirect_json = try jsonStringAlloc(allocator, "http://127.0.0.1:8765/callback?x=\"y\"");
+    defer allocator.free(redirect_json);
+    text = try replaceOwned(allocator, text, "\"http://127.0.0.1:8765/callback\"", redirect_json);
+    defer allocator.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    const x = getObject(parsed.value, "x").?;
+    try std.testing.expectEqualStrings("client\"with\\chars", getString(x, "client_id").?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/callback?x=\"y\"", getString(x, "redirect_uri").?);
+}
+
+test "config template state paths can be rewritten to XDG data directory" {
+    const allocator = std.testing.allocator;
+    var text = try allocator.dupe(u8, config_template);
+    text = try replaceTemplateStatePaths(allocator, text, "/tmp/xdg-data/x-bookmarks");
+    defer allocator.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    const storage = getObject(parsed.value, "storage").?;
+    const viewer = getObject(parsed.value, "viewer").?;
+    try std.testing.expectEqualStrings("/tmp/xdg-data/x-bookmarks/x_bookmarks.sqlite", getString(storage, "database_path").?);
+    try std.testing.expectEqualStrings("/tmp/xdg-data/x-bookmarks/oauth-token.json", getString(storage, "token_path").?);
+    try std.testing.expectEqualStrings("/tmp/xdg-data/x-bookmarks/assets", getString(storage, "assets_dir").?);
+    try std.testing.expectEqualStrings("/tmp/xdg-data/x-bookmarks/viewer-export", getString(viewer, "export_dir").?);
+}
+
+test "embedded config template is valid and carries required defaults" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_template, .{});
+    defer parsed.deinit();
+    const x = getObject(parsed.value, "x").?;
+    const sync = getObject(parsed.value, "sync").?;
+
+    try std.testing.expectEqualStrings("your-client-id", getString(x, "client_id").?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/callback", getString(x, "redirect_uri").?);
+    const scopes = getArray(x, "scopes").?;
+    try std.testing.expect(scopes.items.len == 4);
+    try std.testing.expectEqual(@as(i64, 100), getInt(sync, "max_results").?);
+    try std.testing.expect(getBool(sync, "require_approval").?);
+    try std.testing.expect(getBool(sync, "stop_at_first_complete_bookmark").?);
+}
+
+test "committed config example matches embedded config template" {
+    const allocator = std.testing.allocator;
+    const example = try std.fs.cwd().readFileAlloc(allocator, "config.example.json", 1024 * 1024);
+    defer allocator.free(example);
+    try std.testing.expectEqualStrings(std.mem.trim(u8, example, " \t\r\n"), std.mem.trim(u8, config_template, " \t\r\n"));
+}
+
+test "config validation requires offline access scope for refreshable sync" {
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read" },
+        .database_path = "db.sqlite",
+        .token_path = "oauth-token.json",
+        .assets_dir = "assets",
+        .export_dir = "viewer-export",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+
+    try std.testing.expectError(AppError.ConfigInvalid, validateConfig(cfg));
+}
+
+test "config validation rejects unsupported quote post depth" {
+    var cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = "db.sqlite",
+        .token_path = "oauth-token.json",
+        .assets_dir = "assets",
+        .export_dir = "viewer-export",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 2,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+
+    try std.testing.expectError(AppError.ConfigInvalid, validateConfig(cfg));
+    cfg.quote_post_depth = 1;
+    try validateConfig(cfg);
+}
+
+test "sync CLI overrides mutate only per-run sync settings" {
+    var cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = "db.sqlite",
+        .token_path = "oauth-token.json",
+        .assets_dir = "assets",
+        .export_dir = "viewer-export",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+
+    try applySyncCliOverrides(&cfg, 25, false);
+    try validateConfig(cfg);
+    try std.testing.expectEqual(@as(u32, 25), cfg.max_results);
+    try std.testing.expect(!cfg.download_media);
+
+    try std.testing.expectError(AppError.InvalidArguments, applySyncCliOverrides(&cfg, 0, null));
+    try std.testing.expectError(AppError.InvalidArguments, applySyncCliOverrides(&cfg, 101, null));
+}
+
+test "auth URL encodes required OAuth PKCE parameters" {
+    const allocator = std.testing.allocator;
+    const url = try buildAuthUrl(allocator, "client id", "http://127.0.0.1:8765/callback", default_scopes, "state value", "challenge/value");
+    defer allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "response_type=code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "client_id=client%20id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "scope=tweet.read%20users.read%20bookmark.read%20offline.access") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "state=state%20value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge=challenge%2Fvalue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge_method=S256") != null);
+}
+
+test "callback URL parser extracts and decodes OAuth code without logging callback" {
+    const allocator = std.testing.allocator;
+    const code = try codeFromCallbackUrl(allocator, "http://127.0.0.1:8765/callback?state=abc%201&xcode=wrong&code=a%2Fb%20c&ignored=1#fragment");
+    defer allocator.free(code);
+    const state = try callbackParamFromUrl(allocator, "http://127.0.0.1:8765/callback?state=abc%201&xcode=wrong&code=a%2Fb%20c&ignored=1#fragment", "state");
+    defer allocator.free(state);
+
+    try std.testing.expectEqualStrings("a/b c", code);
+    try std.testing.expectEqualStrings("abc 1", state);
+}
+
+test "callback state validation rejects mismatched OAuth state" {
+    const allocator = std.testing.allocator;
+    var pending = try std.json.parseFromSlice(std.json.Value, allocator, "{\"state\":\"expected-state\"}", .{});
+    defer pending.deinit();
+
+    try validateCallbackState(pending.value, "expected-state");
+    try std.testing.expectError(AppError.AuthRequired, validateCallbackState(pending.value, "wrong-state"));
+}
+
+test "unique run directory names include prefix timestamp and random suffix" {
+    const allocator = std.testing.allocator;
+    const one = try uniqueRunDirectoryName(allocator, "live");
+    defer allocator.free(one);
+    const two = try uniqueRunDirectoryName(allocator, "live");
+    defer allocator.free(two);
+
+    try std.testing.expect(std.mem.startsWith(u8, one, "live-"));
+    try std.testing.expect(std.mem.startsWith(u8, two, "live-"));
+    try std.testing.expect(!std.mem.eql(u8, one, two));
+}
+
+test "private token file writes clamp existing file permissions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "oauth-token.json" });
+    defer allocator.free(path);
+    try ensureParentDir(path);
+    {
+        var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o644 });
+        defer file.close();
+        try file.writeAll("old");
+    }
+
+    try writePrivateFile(path, "secret");
+
+    const stat = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+    const contents = try std.fs.cwd().readFileAlloc(allocator, path, 1024);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("secret", contents);
+}
+
+test "documented application errors map to stable exit codes" {
+    try std.testing.expectEqual(@as(u8, 2), exitCode(AppError.InvalidCommand));
+    try std.testing.expectEqual(@as(u8, 2), exitCode(AppError.InvalidArguments));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(AppError.MissingHome));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(AppError.MissingConfig));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(AppError.ConfigInvalid));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(AppError.ConfigExists));
+    try std.testing.expectEqual(@as(u8, 4), exitCode(AppError.AuthRequired));
+    try std.testing.expectEqual(@as(u8, 5), exitCode(AppError.RateLimited));
+    try std.testing.expectEqual(@as(u8, 6), exitCode(AppError.HttpError));
+    try std.testing.expectEqual(@as(u8, 7), exitCode(AppError.SqliteError));
+}
+
+test "rate limit wait helper only waits for future reset when enabled" {
+    const response = HttpResponse{
+        .status = .too_many_requests,
+        .body = @constCast(""),
+        .rate_limit_reset = 110,
+    };
+    try std.testing.expectEqual(@as(?i64, 10), rateLimitWaitSeconds(response, true, 100));
+    try std.testing.expect(rateLimitWaitSeconds(response, false, 100) == null);
+    try std.testing.expect(rateLimitWaitSeconds(response, true, 110) == null);
+    try std.testing.expect(rateLimitWaitSeconds(.{
+        .status = .too_many_requests,
+        .body = @constCast(""),
+        .rate_limit_reset = null,
+    }, true, 100) == null);
+}
+
+test "numeric CLI argument parsing maps malformed values to invalid arguments" {
+    try std.testing.expectEqual(@as(u32, 42), try parseU32Arg("42"));
+    try std.testing.expectError(AppError.InvalidArguments, parseU32Arg("not-a-number"));
+    try std.testing.expectError(AppError.InvalidArguments, parseU32Arg("-1"));
+}
+
+test "viewer server parses request paths and content types for exported assets" {
+    try std.testing.expectEqualStrings("/data/bookmarks.json", parseHttpPath("GET /data/bookmarks.json?cache=1 HTTP/1.1\r\n").?);
+    try std.testing.expectEqualStrings("/assets/media/movie.mp4", parseHttpPath("HEAD /assets/media/movie.mp4 HTTP/1.1\r\n").?);
+    try std.testing.expectEqualStrings("/assets/media/photo.webp", parseHttpPath("GET /assets/media/photo.webp#ignored HTTP/1.1\r\n").?);
+    try std.testing.expectEqualStrings("application/json", contentType("bookmarks.json"));
+    try std.testing.expectEqualStrings("image/webp", contentType("photo.webp"));
+    try std.testing.expectEqualStrings("video/mp4", contentType("clip.mp4"));
+}
+
+test "viewer server parses byte range headers for video playback" {
+    const range = (try parseRangeHeader("GET /clip.mp4 HTTP/1.1\r\nRange: bytes=10-19\r\n\r\n", 100)).?;
+    try std.testing.expectEqual(@as(u64, 10), range.start);
+    try std.testing.expectEqual(@as(u64, 19), range.end);
+
+    const open_range = (try parseRangeHeader("GET /clip.mp4 HTTP/1.1\r\nRange: bytes=95-\r\n\r\n", 100)).?;
+    try std.testing.expectEqual(@as(u64, 95), open_range.start);
+    try std.testing.expectEqual(@as(u64, 99), open_range.end);
+
+    const suffix_range = (try parseRangeHeader("GET /clip.mp4 HTTP/1.1\r\nrange: bytes=-12\r\n\r\n", 100)).?;
+    try std.testing.expectEqual(@as(u64, 88), suffix_range.start);
+    try std.testing.expectEqual(@as(u64, 99), suffix_range.end);
+
+    try std.testing.expectError(error.InvalidRange, parseRangeHeader("GET /clip.mp4 HTTP/1.1\r\nRange: bytes=150-160\r\n\r\n", 100));
+}
+
+test "migrations are idempotent and create expected tables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "migrations.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+
+    try applyMigrations(&db);
+    try applyMigrations(&db);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM schema_migrations WHERE version = '001_initial'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_warnings'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'bookmark_folder_items'"));
+}
+
+test "database opens with a busy timeout for agent command overlap" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "busy-timeout.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+
+    const stmt = try db.prepare("PRAGMA busy_timeout");
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, 5000), c.sqlite3_column_int(stmt, 0));
+}
+
+test "account upsert sets created timestamp and preserves it on update" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "accounts.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    try upsertAccount(&db, allocator, "acct", "alice", "Alice", "{\"id\":\"acct\"}");
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM accounts WHERE user_id = 'acct' AND created_at IS NOT NULL AND updated_at IS NOT NULL"));
+    try db.exec("UPDATE accounts SET created_at = 'first-created', updated_at = 'first-updated' WHERE user_id = 'acct'");
+    try upsertAccount(&db, allocator, "acct", "alice2", "Alice 2", "{\"id\":\"acct\",\"username\":\"alice2\"}");
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM accounts WHERE user_id = 'acct' AND username = 'alice2' AND created_at = 'first-created' AND updated_at <> 'first-updated'"));
+}
+
+test "token observations persist refresh metadata without storing token secrets" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "token-observation.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = db_path,
+        .token_path = "/tmp/oauth-token.json",
+        .assets_dir = ".",
+        .export_dir = ".",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+    try upsertTokenObservationFromState(&db, allocator, cfg, "acct", .{
+        .access_token = "secret-access",
+        .refresh_token = "secret-refresh",
+        .token_type = "bearer",
+        .scope = "tweet.read users.read bookmark.read offline.access",
+        .expires_at = 1234,
+        .account_user_id = "acct",
+    });
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM oauth_token_observations WHERE account_user_id = 'acct' AND token_type = 'bearer' AND expires_at = '1234'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM oauth_token_observations WHERE scope LIKE '%secret%' OR token_file_path LIKE '%secret%'"));
+}
+
+test "loadToken returns owned token strings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const token_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "oauth-token.json" });
+    defer allocator.free(token_path);
+    const token_json =
+        \\{
+        \\  "access_token": "access-123",
+        \\  "refresh_token": "refresh-123",
+        \\  "token_type": "bearer",
+        \\  "scope": "tweet.read users.read bookmark.read offline.access",
+        \\  "expires_at": 123456,
+        \\  "account_user_id": "acct-123"
+        \\}
+    ;
+    try std.fs.cwd().writeFile(.{ .sub_path = token_path, .data = token_json });
+
+    const token = try loadToken(allocator, token_path);
+    defer token.deinit(allocator);
+
+    try std.testing.expectEqualStrings("access-123", token.access_token);
+    try std.testing.expectEqualStrings("refresh-123", token.refresh_token.?);
+    try std.testing.expectEqualStrings("bearer", token.token_type.?);
+    try std.testing.expectEqualStrings("tweet.read users.read bookmark.read offline.access", token.scope.?);
+    try std.testing.expectEqual(@as(?i64, 123456), token.expires_at);
+    try std.testing.expectEqualStrings("acct-123", token.account_user_id.?);
+}
+
+test "empty account id is treated as missing token account metadata" {
+    try std.testing.expect(nonEmptyOptional(null) == null);
+    try std.testing.expect(nonEmptyOptional("") == null);
+    try std.testing.expectEqualStrings("acct", nonEmptyOptional("acct").?);
+}
+
+test "optional JSON string helper preserves null instead of empty account id" {
+    const allocator = std.testing.allocator;
+    const missing = try optionalJsonStringAlloc(allocator, null);
+    defer allocator.free(missing);
+    const present = try optionalJsonStringAlloc(allocator, "acct");
+    defer allocator.free(present);
+
+    try std.testing.expectEqualStrings("null", missing);
+    try std.testing.expectEqualStrings("\"acct\"", present);
+}
+
+test "canonical URI uses username when available and fallback otherwise" {
+    const allocator = std.testing.allocator;
+    const with_user = try canonicalUri(allocator, "alice", "123");
+    defer allocator.free(with_user);
+    const fallback = try canonicalUri(allocator, null, "123");
+    defer allocator.free(fallback);
+
+    try std.testing.expectEqualStrings("https://x.com/alice/status/123", with_user);
+    try std.testing.expectEqualStrings("https://x.com/i/web/status/123", fallback);
+}
+
+test "tweet media upsert replaces stale attachment relationships" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "tweet-media-replace.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var first = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"tm1","text":"with media","attachments":{"media_keys":["old_media","new_media"]}}
+    , .{});
+    defer first.deinit();
+    try upsertTweetFromValue(&db, allocator, first.value);
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM tweet_media WHERE tweet_id = 'tm1'"));
+
+    var second = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"tm1","text":"updated media","attachments":{"media_keys":["new_media"]}}
+    , .{});
+    defer second.deinit();
+    try upsertTweetFromValue(&db, allocator, second.value);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM tweet_media WHERE tweet_id = 'tm1' AND media_key = 'new_media'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM tweet_media WHERE tweet_id = 'tm1' AND media_key = 'old_media'"));
+
+    var third = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"tm1","text":"no media"}
+    , .{});
+    defer third.deinit();
+    try upsertTweetFromValue(&db, allocator, third.value);
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM tweet_media WHERE tweet_id = 'tm1'"));
+}
+
+test "video variant selection chooses preview-sized mp4" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"content_type":"application/x-mpegURL","url":"https://example.invalid/playlist.m3u8"},
+        \\  {"content_type":"video/mp4","url":"https://example.invalid/low.mp4","bit_rate":256000},
+        \\  {"content_type":"video/mp4","url":"https://example.invalid/preview.mp4","bit_rate":2176000},
+        \\  {"content_type":"video/mp4","url":"https://example.invalid/huge.mp4","bit_rate":25128000}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("https://example.invalid/preview.mp4", selectVideoVariant(parsed.value.array).?);
+}
+
+test "video variant selection falls back to smallest mp4 when all are above preview size" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"content_type":"video/mp4","url":"https://example.invalid/large.mp4","bit_rate":8000000},
+        \\  {"content_type":"video/mp4","url":"https://example.invalid/larger.mp4","bit_rate":12000000}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("https://example.invalid/large.mp4", selectVideoVariant(parsed.value.array).?);
+}
+
+test "bookmark request metadata records concrete query field lists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const paths = try resolvePaths(allocator, null, home);
+    const cfg = try Config.default(allocator, paths, home);
+    const request_json = try syncRequestJson(allocator, cfg, false, true, 2);
+
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"endpoint\":\"GET /2/users/:id/bookmarks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"tweet.fields\":\"id,text,author_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"expansions\":\"author_id,attachments.media_keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"media.fields\":\"media_key,type,url,preview_image_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"folder_request_shape\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"folders_endpoint\":\"GET /2/users/:id/bookmarks/folders\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"folder_items_endpoint\":\"GET /2/users/:id/bookmarks/folders/:folder_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_json, "\"limit_pages\":2") != null);
+}
+
+test "bookmark URL uses stable fields and URL-encoded pagination token" {
+    const allocator = std.testing.allocator;
+    const url = try buildBookmarksUrl(allocator, "123", 100, "next token/1");
+    defer allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "/2/users/123/bookmarks?max_results=100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "tweet.fields=id,text,author_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "expansions=author_id,attachments.media_keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "user.fields=id,name,username") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "media.fields=media_key,type,url,preview_image_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "poll.fields=id,options,duration_minutes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "pagination_token=next%20token%2F1") != null);
+}
+
+test "bookmark folders URL carries URL-encoded pagination token" {
+    const allocator = std.testing.allocator;
+    const first = try buildBookmarkFoldersUrl(allocator, "123", null);
+    defer allocator.free(first);
+    const next = try buildBookmarkFoldersUrl(allocator, "123", "folder page/1");
+    defer allocator.free(next);
+
+    try std.testing.expectEqualStrings(x_api_base ++ "/users/123/bookmarks/folders", first);
+    try std.testing.expect(std.mem.indexOf(u8, next, "pagination_token=folder%20page%2F1") != null);
+}
+
+test "bookmark folder items URL uses documented endpoint with URL-encoded pagination token" {
+    const allocator = std.testing.allocator;
+    const first = try buildBookmarkFolderItemsUrl(allocator, "123", "folder%201", null);
+    defer allocator.free(first);
+    const next = try buildBookmarkFolderItemsUrl(allocator, "123", "folder%201", "item page/1");
+    defer allocator.free(next);
+
+    try std.testing.expectEqualStrings(x_api_base ++ "/users/123/bookmarks/folders/folder%201", first);
+    try std.testing.expect(std.mem.indexOf(u8, next, "pagination_token=item%20page%2F1") != null);
+}
+
+test "fixture ingestion stores quote media folders and export metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "fixture.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const fixture = try std.fs.cwd().readFileAlloc(allocator, "tests/fixtures/bookmark-page-with-quote-media.json", 1024 * 1024);
+    defer allocator.free(fixture);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture, .{});
+    defer parsed.deinit();
+
+    const account = "acct";
+    const run_id = try createSyncRun(&db, account, "fixture", "{\"fixture\":true}", allocator);
+    try insertRawPage(&db, allocator, run_id, 1, null, null, 1, fixture);
+    try ingestIncludes(&db, allocator, parsed.value);
+    const tweets = getArray(parsed.value, "data").?;
+    for (tweets.items, 0..) |tweet, idx| {
+        try upsertTweetFromValue(&db, allocator, tweet);
+        const tweet_id = getString(tweet, "id").?;
+        try recordMediaAsset(&db, allocator, "3_abc", "image", "https://example.invalid/photo.jpg", "/missing/photo.jpg", "image/jpeg", 12, "0000", 1200, 800, "failed", "{\"error\":\"fixture\"}");
+        try recordMediaAsset(&db, allocator, "3_quote", "image", "https://example.invalid/quote.jpg", "/tmp/quote.jpg", "image/jpeg", 12, "1111", 900, 600, "downloaded", null);
+        const complete = try bookmarkCompleteForOfflineRender(&db, allocator, tweet_id);
+        _ = try upsertBookmarkItem(&db, allocator, account, tweet_id, run_id, @intCast(idx), complete);
+    }
+    var folder_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"folder-1\",\"name\":\"Reading\"}", .{});
+    defer folder_parsed.deinit();
+    try upsertFolderFromValue(&db, allocator, account, folder_parsed.value);
+    try upsertFolderItem(&db, allocator, account, "folder-1", "100");
+
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM tweets"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM users"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM media"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE complete_for_offline_render = 0"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_folder_items"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM missing_references"));
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try exportJsonl(&db, allocator, out.writer(allocator));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"canonical_uri\":\"https://x.com/alice/status/100\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"twitter_uri\":\"https://twitter.com/i/web/status/100\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"folder_ids\":[\"folder-1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"folders\":[{\"folder_id\":\"folder-1\",\"name\":\"Reading\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"quote_posts\":[{\"tweet_id\":\"200\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"local_asset_paths\":[\"/tmp/quote.jpg\"]") != null);
+}
+
+test "bookmark page ingestion can be committed as a single page transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "page-transaction.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const fixture = try std.fs.cwd().readFileAlloc(allocator, "tests/fixtures/bookmark-page-with-quote-media.json", 1024 * 1024);
+    defer allocator.free(fixture);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture, .{});
+    defer parsed.deinit();
+
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = db_path,
+        .token_path = "token.json",
+        .assets_dir = ".",
+        .export_dir = ".",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    var result = SyncResult{};
+    try beginTransaction(&db);
+    try ingestBookmarkPage(&db, allocator, cfg, "acct", run_id, false, 1, null, null, 1, fixture, parsed.value, &result);
+    try commitTransaction(&db);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM raw_pages"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_items"));
+    try std.testing.expectEqual(@as(u32, 1), result.tweets);
+}
+
+test "empty bookmark page stores raw page without bookmark rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "empty-page.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const body =
+        \\{"data":[],"meta":{"result_count":0}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = db_path,
+        .token_path = "token.json",
+        .assets_dir = ".",
+        .export_dir = ".",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    var result = SyncResult{};
+    try beginTransaction(&db);
+    try ingestBookmarkPage(&db, allocator, cfg, "acct", run_id, false, 1, null, null, 0, body, parsed.value, &result);
+    try commitTransaction(&db);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM raw_pages WHERE result_count = 0"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM bookmark_items"));
+    try std.testing.expectEqual(@as(u32, 0), result.tweets);
+}
+
+test "incremental page ingestion stops at first complete bookmark" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "early-stop.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "600", 1, 0, true);
+    const body =
+        \\{"data":[{"id":"600","text":"already complete"},{"id":"601","text":"new after complete"}],"meta":{"result_count":2}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = db_path,
+        .token_path = "token.json",
+        .assets_dir = ".",
+        .export_dir = ".",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+    const run_id = try createSyncRun(&db, "acct", "incremental", "{}", allocator);
+    var result = SyncResult{};
+    defer if (result.early_stop_tweet_id) |value| allocator.free(value);
+    try beginTransaction(&db);
+    try ingestBookmarkPage(&db, allocator, cfg, "acct", run_id, false, 1, null, null, 2, body, parsed.value, &result);
+    try commitTransaction(&db);
+
+    try std.testing.expect(result.early_stop_used);
+    try std.testing.expectEqualStrings("600", result.early_stop_tweet_id.?);
+    try std.testing.expectEqual(@as(u32, 0), result.tweets);
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE tweet_id = '601'"));
+}
+
+test "partial response with errors and data still ingests available bookmark data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "partial-errors.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const body =
+        \\{
+        \\  "data": [{"id":"500","author_id":"5","text":"available despite errors"}],
+        \\  "includes": {"users": [{"id":"5","username":"erin","name":"Erin"}]},
+        \\  "errors": [{"title":"Not Found Error","detail":"one expanded object was unavailable"}],
+        \\  "meta": {"result_count":1}
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const cfg = Config{
+        .client_id = "client",
+        .client_secret = null,
+        .redirect_uri = "http://127.0.0.1:8765/callback",
+        .scopes = &.{ "tweet.read", "users.read", "bookmark.read", "offline.access" },
+        .database_path = db_path,
+        .token_path = "token.json",
+        .assets_dir = ".",
+        .export_dir = ".",
+        .max_results = 100,
+        .store_raw_pages = true,
+        .download_media = true,
+        .quote_post_depth = 1,
+        .require_approval = true,
+        .stop_at_first_complete_bookmark = true,
+        .config_path = "config.json",
+        .base_dir = ".",
+        .home_override = null,
+    };
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    var result = SyncResult{};
+    try beginTransaction(&db);
+    try ingestBookmarkPage(&db, allocator, cfg, "acct", run_id, false, 1, null, null, 1, body, parsed.value, &result);
+    try commitTransaction(&db);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE tweet_id = '500' AND complete_for_offline_render = 1"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM raw_pages WHERE response_json LIKE '%Not Found Error%'"));
+    try std.testing.expectEqual(@as(u32, 1), result.tweets);
+}
+
+test "page transaction rollback removes media asset and bookmark writes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "page-rollback.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    try beginTransaction(&db);
+    try recordMediaAsset(&db, allocator, "m1", "image", "https://example.invalid/a.jpg", "/tmp/a.jpg", "image/jpeg", 1, null, null, null, "downloaded", null);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "tweet", 1, 0, true);
+    try rollbackTransaction(&db);
+
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM media_assets"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM bookmark_items"));
+}
+
+test "full sync deactivates bookmarks not seen in the run" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "full.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "old", 999, 0, true);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "seen", 999, 1, true);
+
+    const run_id = try createSyncRun(&db, "acct", "full", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "seen", run_id, 0, true);
+    try markBookmarksInactiveNotSeen(&db, "acct", run_id);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE active = 1"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE active = 0 AND tweet_id = 'old'"));
+}
+
+test "limited full sync does not deactivate bookmarks outside the limited scan" {
+    try std.testing.expect(shouldDeactivateMissingAfterSync(true, null));
+    try std.testing.expect(!shouldDeactivateMissingAfterSync(true, 1));
+    try std.testing.expect(!shouldDeactivateMissingAfterSync(false, null));
+}
+
+test "missing quoted post references are recorded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "missing.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"101","author_id":"1","text":"quote missing","referenced_tweets":[{"type":"quoted","id":"999"}]}
+    , .{});
+    defer parsed.deinit();
+    try upsertTweetFromValue(&db, allocator, parsed.value);
+    try recordMissingQuoteReferences(&db, allocator, parsed.value, parsed.value);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM missing_references WHERE tweet_id = '101' AND referenced_tweet_id = '999'"));
+}
+
+test "missing quoted post references preserve protected error status" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "missing-status.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var page = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "data": [{"id":"102","author_id":"1","text":"quote protected","referenced_tweets":[{"type":"quoted","id":"888"}]}],
+        \\  "errors": [{"resource_id":"888","title":"Authorization Error","detail":"This Tweet is protected"}],
+        \\  "meta": {"result_count":1}
+        \\}
+    , .{});
+    defer page.deinit();
+    const tweet = getArray(page.value, "data").?.items[0];
+    try upsertTweetFromValue(&db, allocator, tweet);
+    try recordMissingQuoteReferences(&db, allocator, page.value, tweet);
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM missing_references WHERE tweet_id = '102' AND referenced_tweet_id = '888' AND status = 'protected'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM missing_references WHERE raw_json LIKE '%Authorization Error%'"));
+}
+
+test "offline completeness requires stored author metadata when author id is present" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "author-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"301\",\"author_id\":\"42\",\"text\":\"needs author\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "301"));
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"42\",\"username\":\"author\",\"name\":\"Author\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "301"));
+}
+
+test "offline completeness accepts missing quote records as explicit unavailable state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "quote-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"302","author_id":"1","text":"quote missing","referenced_tweets":[{"type":"quoted","id":"999"}]}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "302"));
+    try recordMissingQuoteReferences(&db, allocator, tweet.value, tweet.value);
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "302"));
+}
+
+test "jsonl export includes missing quote reference placeholders" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "jsonl-missing-ref.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"307","author_id":"1","text":"quote missing","referenced_tweets":[{"type":"quoted","id":"999"}]}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    try recordMissingQuoteReferences(&db, allocator, tweet.value, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "307", run_id, 0, true);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try exportJsonl(&db, allocator, out.writer(allocator));
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"missing_references\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"referenced_tweet_id\":\"999\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reference_type\":\"quoted\"") != null);
+}
+
+test "jsonl export includes local author avatar paths" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "jsonl-avatar.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"13\",\"username\":\"avatarjsonl\",\"name\":\"Avatar Jsonl\",\"profile_image_url\":\"https://example.invalid/avatar.jpg\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"310\",\"author_id\":\"13\",\"text\":\"avatar jsonl\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    try finishSyncRun(&db, run_id, "succeeded", 1, 1, 1, false, null, null, allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "310", run_id, 0, true);
+    try recordMediaAsset(&db, allocator, "user:13", "author_avatar", "https://example.invalid/avatar.jpg", "/tmp/avatar-jsonl.jpg", "image/jpeg", 12, null, null, null, "downloaded", null);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try validateCompleteBookmarksForExport(&db, allocator);
+    try exportJsonl(&db, allocator, out.writer(allocator));
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"author_avatar_path\":\"/tmp/avatar-jsonl.jpg\"") != null);
+}
+
+test "jsonl export validation rejects stale complete bookmark rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "jsonl-stale.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"12\",\"username\":\"jsonlstale\",\"name\":\"Jsonl Stale\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var media = try std.json.parseFromSlice(std.json.Value, allocator, "{\"media_key\":\"jsonl_media\",\"type\":\"photo\",\"url\":\"https://example.invalid/jsonl.jpg\"}", .{});
+    defer media.deinit();
+    try upsertMediaFromValue(&db, allocator, media.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"309\",\"author_id\":\"12\",\"text\":\"stale jsonl\",\"attachments\":{\"media_keys\":[\"jsonl_media\"]}}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    try finishSyncRun(&db, run_id, "succeeded", 1, 1, 1, false, null, null, allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "309", run_id, 0, true);
+
+    try std.testing.expectError(AppError.IoError, validateCompleteBookmarksForExport(&db, allocator));
+}
+
+test "failed author avatar makes bookmark incomplete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "avatar.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"300\",\"author_id\":\"42\",\"text\":\"avatar failure\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    try recordMediaAsset(&db, allocator, "user:42", "author_avatar", "https://example.invalid/avatar.jpg", "", "image/jpeg", 0, null, null, null, "failed", "{\"error\":\"fixture\"}");
+
+    try std.testing.expect(try tweetHasFailedAssets(&db, allocator, "300"));
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "300"));
+}
+
+test "offline completeness requires local media assets for attached media" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "required-media.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"7\",\"username\":\"mediauser\",\"name\":\"Media User\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+
+    var media = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"media_key":"3_photo","type":"photo","url":"https://example.invalid/photo.jpg","width":1200,"height":800}
+    , .{});
+    defer media.deinit();
+    try upsertMediaFromValue(&db, allocator, media.value);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"303","author_id":"7","text":"attached media","attachments":{"media_keys":["3_photo"]}}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "303"));
+    try recordMediaAsset(&db, allocator, "3_photo", "image", "https://example.invalid/photo.jpg", "/tmp/photo.jpg", "image/jpeg", 12, null, 1200, 800, "downloaded", null);
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "303"));
+}
+
+test "offline completeness accepts skipped video variants as accounted for" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "required-video.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"8\",\"username\":\"videouser\",\"name\":\"Video User\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+
+    var media = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"media_key":"7_video","type":"video","preview_image_url":"https://example.invalid/preview.jpg","variants":[{"content_type":"application/x-mpegURL","url":"https://example.invalid/stream.m3u8"}]}
+    , .{});
+    defer media.deinit();
+    try upsertMediaFromValue(&db, allocator, media.value);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"304","author_id":"8","text":"attached video","attachments":{"media_keys":["7_video"]}}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "304"));
+    try recordMediaAsset(&db, allocator, "7_video", "preview_image", "https://example.invalid/preview.jpg", "/tmp/preview.jpg", "image/jpeg", 12, null, null, null, "downloaded", null);
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "304"));
+    try recordMediaAsset(&db, allocator, "7_video", "video_variant", "x-bookmarks:media:7_video:variant", "", null, 0, null, null, null, "skipped", "{\"reason\":\"no_mp4_variant\"}");
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "304"));
+}
+
+test "skipped media asset records are idempotent by media key kind and source" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "skipped-idempotent.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    try recordSkippedMediaAssetOnce(&db, allocator, "7_video", "video_variant", "x-bookmarks:media:7_video:variant", 640, 360, "{\"reason\":\"no_mp4_variant\"}");
+    try recordSkippedMediaAssetOnce(&db, allocator, "7_video", "video_variant", "x-bookmarks:media:7_video:variant", 640, 360, "{\"reason\":\"no_mp4_variant\"}");
+    try recordSkippedMediaAssetOnce(&db, allocator, "8_video", "video_variant", "x-bookmarks:media:8_video:variant", 640, 360, "{\"reason\":\"no_mp4_variant\"}");
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE media_key = '7_video' AND status = 'skipped'"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE status = 'skipped'"));
+}
+
+test "offline completeness requires local avatar asset when user has avatar url" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "required-avatar.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"9","username":"avataruser","name":"Avatar User","profile_image_url":"https://example.invalid/avatar.jpg"}
+    , .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"305\",\"author_id\":\"9\",\"text\":\"avatar required\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    try std.testing.expect(!try bookmarkCompleteForOfflineRender(&db, allocator, "305"));
+    try recordMediaAsset(&db, allocator, "user:9", "author_avatar", "https://example.invalid/avatar.jpg", "/tmp/avatar.jpg", "image/jpeg", 12, null, null, null, "downloaded", null);
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "305"));
+}
+
+test "asset idempotency verifies local file hash and reuses existing content hash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const db_path = try std.fs.path.join(allocator, &.{ tmp_root, "assets.sqlite" });
+    defer allocator.free(db_path);
+    const asset_path = try std.fs.path.join(allocator, &.{ tmp_root, "asset.bin" });
+    defer allocator.free(asset_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "same bytes" });
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("same bytes", &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try recordMediaAsset(&db, allocator, "m1", "image", "https://example.invalid/a.jpg", asset_path, "image/jpeg", 10, &hash, null, null, "downloaded", null);
+
+    try std.testing.expect(try assetSourceValid(&db, allocator, "https://example.invalid/a.jpg"));
+    try std.testing.expect(!try assetSourceValid(&db, allocator, "https://example.invalid/missing.jpg"));
+    const reused = (try downloadedPathForHash(&db, allocator, &hash)).?;
+    defer allocator.free(reused);
+    try std.testing.expectEqualStrings(asset_path, reused);
+
+    try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "changed" });
+    try std.testing.expect(!try assetSourceValid(&db, allocator, "https://example.invalid/a.jpg"));
+    try std.testing.expect(try downloadedPathForHash(&db, allocator, &hash) == null);
+}
+
+test "asset source reuse records current media key without redownload" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const db_path = try std.fs.path.join(allocator, &.{ tmp_root, "asset-source-reuse.sqlite" });
+    defer allocator.free(db_path);
+    const asset_path = try std.fs.path.join(allocator, &.{ tmp_root, "asset.bin" });
+    defer allocator.free(asset_path);
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "assets" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "same bytes" });
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("same bytes", &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try recordMediaAsset(&db, allocator, "m1", "image", "https://example.invalid/shared.jpg", asset_path, "image/jpeg", 10, &hash, 100, 100, "downloaded", null);
+
+    try downloadAsset(&db, allocator, assets_dir, "m1", "image", "https://example.invalid/shared.jpg", 100, 100);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE media_key = 'm1' AND source_url = 'https://example.invalid/shared.jpg'"));
+
+    try downloadAsset(&db, allocator, assets_dir, "m2", "image", "https://example.invalid/shared.jpg", 200, 150);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE media_key = 'm2' AND asset_kind = 'image' AND byte_size = 10 AND width = 200 AND height = 150"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE source_url = 'https://example.invalid/shared.jpg' AND status = 'downloaded'"));
+
+    try downloadAsset(&db, allocator, assets_dir, "m1", "image", "https://example.invalid/shared.jpg", 100, 100);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM media_assets WHERE media_key = 'm1' AND source_url = 'https://example.invalid/shared.jpg'"));
+}
+
+test "asset reuse skips corrupt newest candidate and uses older valid candidate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const db_path = try std.fs.path.join(allocator, &.{ tmp_root, "asset-candidates.sqlite" });
+    defer allocator.free(db_path);
+    const valid_path = try std.fs.path.join(allocator, &.{ tmp_root, "valid.bin" });
+    defer allocator.free(valid_path);
+    const corrupt_path = try std.fs.path.join(allocator, &.{ tmp_root, "corrupt.bin" });
+    defer allocator.free(corrupt_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = valid_path, .data = "same bytes" });
+    try std.fs.cwd().writeFile(.{ .sub_path = corrupt_path, .data = "changed" });
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("same bytes", &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try recordMediaAsset(&db, allocator, "old", "image", "https://example.invalid/candidate.jpg", valid_path, "image/jpeg", 10, &hash, null, null, "downloaded", null);
+    try recordMediaAsset(&db, allocator, "new", "image", "https://example.invalid/candidate.jpg", corrupt_path, "image/jpeg", 10, &hash, null, null, "downloaded", null);
+
+    const source_asset = (try validAssetForSource(&db, allocator, "https://example.invalid/candidate.jpg")).?;
+    defer source_asset.deinit(allocator);
+    try std.testing.expectEqualStrings(valid_path, source_asset.local_path);
+
+    const hash_path = (try downloadedPathForHash(&db, allocator, &hash)).?;
+    defer allocator.free(hash_path);
+    try std.testing.expectEqualStrings(valid_path, hash_path);
+}
+
+test "structured sync warnings are persisted for degraded folder sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "warnings.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    const run_id = try createSyncRun(&db, "acct", "incremental", "{}", allocator);
+    try recordSyncWarning(&db, allocator, run_id, "bookmark_folder_sync_failed", "{\"endpoint\":\"folders\",\"http_status\":403}");
+
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM sync_warnings WHERE sync_run_id > 0 AND warning_type = 'bookmark_folder_sync_failed'"));
+}
+
+test "folder item pruning removes memberships absent from successful folder scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "folder-prune.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    try upsertFolderItem(&db, allocator, "acct", "folder1", "old");
+    try upsertFolderItem(&db, allocator, "acct", "folder1", "keep");
+    try upsertFolderItem(&db, allocator, "acct", "folder2", "old");
+
+    try beginFolderItemPrune(&db);
+    try rememberFolderItemForPrune(&db, "keep");
+    try pruneFolderItemsNotSeen(&db, "acct", "folder1");
+
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM bookmark_folder_items WHERE account_user_id = 'acct' AND folder_id = 'folder1' AND tweet_id = 'old'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_folder_items WHERE account_user_id = 'acct' AND folder_id = 'folder1' AND tweet_id = 'keep'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&db, "SELECT count(*) FROM bookmark_folder_items WHERE account_user_id = 'acct' AND folder_id = 'folder2' AND tweet_id = 'old'"));
+}
+
+test "viewer export rejects stale complete bookmark rows with missing required assets" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "stale-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"10\",\"username\":\"stale\",\"name\":\"Stale\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+
+    var media = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"media_key":"3_stale","type":"photo","url":"https://example.invalid/stale.jpg"}
+    , .{});
+    defer media.deinit();
+    try upsertMediaFromValue(&db, allocator, media.value);
+
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"306","author_id":"10","text":"stale complete","attachments":{"media_keys":["3_stale"]}}
+    , .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "306", run_id, 0, true);
+
+    try std.testing.expectError(AppError.IoError, validateCompleteBookmarksForExport(&db, allocator));
+    try recordMediaAsset(&db, allocator, "3_stale", "image", "https://example.invalid/stale.jpg", "/tmp/stale.jpg", "image/jpeg", 12, null, null, null, "downloaded", null);
+    try finishSyncRun(&db, run_id, "succeeded", 1, 1, 1, false, null, null, allocator);
+    try validateCompleteBookmarksForExport(&db, allocator);
+}
+
+test "viewer export rejects complete bookmarks whose folder sync run did not succeed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "folder-state-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"11\",\"username\":\"folderstate\",\"name\":\"Folder State\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"308\",\"author_id\":\"11\",\"text\":\"needs folder state\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "308", run_id, 0, true);
+
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "308"));
+    try std.testing.expectError(AppError.IoError, validateCompleteBookmarksForExport(&db, allocator));
+    try finishSyncRun(&db, run_id, "succeeded", 1, 1, 1, false, null, null, allocator);
+    try validateCompleteBookmarksForExport(&db, allocator);
+}
+
+test "degraded folder sync prevents offline completeness for current run" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "folder-degraded-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"12\",\"username\":\"degraded\",\"name\":\"Degraded\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"309\",\"author_id\":\"12\",\"text\":\"folder degraded\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "309", run_id, 0, true);
+    try std.testing.expect(try bookmarkCompleteForOfflineRender(&db, allocator, "309"));
+
+    try refreshBookmarkCompletenessForRun(&db, allocator, "acct", run_id, false);
+
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM bookmark_items WHERE account_user_id = 'acct' AND tweet_id = '309' AND complete_for_offline_render = 1"));
+}
+
+test "viewer export rejects complete bookmarks from runs with folder warnings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "folder-warning-complete.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"14\",\"username\":\"warned\",\"name\":\"Warned\"}", .{});
+    defer user.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"311\",\"author_id\":\"14\",\"text\":\"folder warning\"}", .{});
+    defer tweet.deinit();
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    try finishSyncRun(&db, run_id, "succeeded", 1, 1, 1, false, null, null, allocator);
+    try recordSyncWarning(&db, allocator, run_id, "bookmark_folder_sync_failed", "{\"endpoint\":\"folders\",\"http_status\":403}");
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "311", run_id, 0, true);
+
+    try std.testing.expectError(AppError.IoError, validateCompleteBookmarksForExport(&db, allocator));
+}
+
+test "summary quote post count only includes distinct stored quote posts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "quote-count.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var quote = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"q1\",\"text\":\"stored quote\"}", .{});
+    defer quote.deinit();
+    try upsertTweetFromValue(&db, allocator, quote.value);
+
+    var parent = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"p1","text":"parent","referenced_tweets":[{"type":"replied_to","id":"r1"},{"type":"quoted","id":"q1"},{"type":"quoted","id":"missing"}]}
+    , .{});
+    defer parent.deinit();
+    try upsertTweetFromValue(&db, allocator, parent.value);
+
+    var another = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"p2","text":"parent 2","referenced_tweets":[{"type":"quoted","id":"q1"}]}
+    , .{});
+    defer another.deinit();
+    try upsertTweetFromValue(&db, allocator, another.value);
+
+    try std.testing.expectEqual(@as(i64, 1), try countStoredQuotePosts(&db, allocator));
+}
+
+test "viewer export carries local avatar assets and sync warnings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const db_path = try std.fs.path.join(allocator, &.{ tmp_root, "viewer.sqlite" });
+    defer allocator.free(db_path);
+    const asset_path = try std.fs.path.join(allocator, &.{ tmp_root, "avatar.jpg" });
+    defer allocator.free(asset_path);
+    const export_dir = try std.fs.path.join(allocator, &.{ tmp_root, "viewer-export" });
+    defer allocator.free(export_dir);
+
+    try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "abc" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var user = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"1","username":"alice","name":"Alice","profile_image_url":"https://example.invalid/avatar.jpg"}
+    , .{});
+    defer user.deinit();
+    var tweet = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"400","author_id":"1","text":"viewer export"}
+    , .{});
+    defer tweet.deinit();
+    try upsertUserFromValue(&db, allocator, user.value);
+    try upsertTweetFromValue(&db, allocator, tweet.value);
+    const run_id = try createSyncRun(&db, "acct", "fixture", "{}", allocator);
+    _ = try upsertBookmarkItem(&db, allocator, "acct", "400", run_id, 0, true);
+    try recordMediaAsset(&db, allocator, "user:1", "author_avatar", "https://example.invalid/avatar.jpg", asset_path, "image/jpeg", 3, null, null, null, "downloaded", null);
+    try recordSyncWarning(&db, allocator, run_id, "bookmark_folder_sync_failed", "{\"endpoint\":\"folders\",\"http_status\":403}");
+
+    const bookmarks_path = try std.fs.path.join(allocator, &.{ export_dir, "data", "bookmarks.json" });
+    defer allocator.free(bookmarks_path);
+    const media_path = try std.fs.path.join(allocator, &.{ export_dir, "data", "media-assets.json" });
+    defer allocator.free(media_path);
+    const warnings_path = try std.fs.path.join(allocator, &.{ export_dir, "data", "sync-warnings.json" });
+    defer allocator.free(warnings_path);
+    const summary_path = try std.fs.path.join(allocator, &.{ export_dir, "data", "sync-summary.json" });
+    defer allocator.free(summary_path);
+
+    const data_dir = try std.fs.path.join(allocator, &.{ export_dir, "data" });
+    defer allocator.free(data_dir);
+    try std.fs.cwd().makePath(data_dir);
+    try writeQueryJsonArray(&db, allocator, bookmarks_path,
+        \\SELECT b.account_user_id, b.tweet_id, b.complete_for_offline_render, t.canonical_uri, t.twitter_uri,
+        \\       coalesce(t.text, ''), coalesce(t.created_at, ''), coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(u.name, ''),
+        \\       coalesce(u.profile_image_url, ''), t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    , &.{ "account_user_id", "tweet_id", "complete_for_offline_render:bool", "canonical_uri", "twitter_uri", "text", "created_at", "author_id", "author_username", "author_name", "author_avatar_url", "raw_json" });
+    try writeMediaAssetsJsonAndCopy(&db, allocator, media_path, export_dir);
+    try writeQueryJsonArray(&db, allocator, warnings_path, "SELECT sync_run_id, warning_type, context_json, created_at FROM sync_warnings ORDER BY id", &.{ "sync_run_id:int", "warning_type", "context_json", "created_at" });
+    try writeSummaryJson(&db, allocator, summary_path);
+
+    const bookmarks_json = try std.fs.cwd().readFileAlloc(allocator, bookmarks_path, 1024 * 1024);
+    defer allocator.free(bookmarks_json);
+    const media_json = try std.fs.cwd().readFileAlloc(allocator, media_path, 1024 * 1024);
+    defer allocator.free(media_json);
+    const warnings_json = try std.fs.cwd().readFileAlloc(allocator, warnings_path, 1024 * 1024);
+    defer allocator.free(warnings_json);
+    const summary_json = try std.fs.cwd().readFileAlloc(allocator, summary_path, 1024 * 1024);
+    defer allocator.free(summary_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, bookmarks_json, "\"author_id\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, media_json, "\"viewer_path\":\"assets/media-assets/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings_json, "\"warning_type\":\"bookmark_folder_sync_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_json, "\"new_bookmarks\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_json, "\"sync_warnings\": 1") != null);
+}
+
+test "viewer export reset removes stale files before regeneration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const export_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "viewer-export" });
+    defer allocator.free(export_dir);
+    const stale_path = try std.fs.path.join(allocator, &.{ export_dir, "assets", "stale.js" });
+    defer allocator.free(stale_path);
+    try ensureParentDir(stale_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = stale_path, .data = "stale" });
+    try std.testing.expect(fileExists(stale_path));
+
+    try resetExportDir(allocator, export_dir);
+
+    try std.testing.expect(!fileExists(stale_path));
+    const data_dir = try std.fs.path.join(allocator, &.{ export_dir, "data" });
+    defer allocator.free(data_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ export_dir, "assets" });
+    defer allocator.free(assets_dir);
+    const static_dir = try std.fs.path.join(allocator, &.{ export_dir, "static" });
+    defer allocator.free(static_dir);
+    try std.testing.expect(fileExists(data_dir));
+    try std.testing.expect(fileExists(assets_dir));
+    try std.testing.expect(fileExists(static_dir));
+}
+
+test "viewer export file validation requires static shell and data manifests" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const export_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "viewer-export" });
+    defer allocator.free(export_dir);
+    try std.fs.cwd().makePath(export_dir);
+    try std.testing.expectError(AppError.IoError, validateViewerExportFiles(allocator, export_dir));
+
+    const required = [_][]const u8{
+        "index.html",
+        "data/bookmarks.json",
+        "data/tweets.json",
+        "data/folders.json",
+        "data/folder-items.json",
+        "data/media-assets.json",
+        "data/tweet-media.json",
+        "data/missing-references.json",
+        "data/sync-warnings.json",
+        "data/sync-summary.json",
+    };
+    for (required) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ export_dir, rel });
+        defer allocator.free(path);
+        try ensureParentDir(path);
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "{}" });
+    }
+    try validateViewerExportFiles(allocator, export_dir);
+
+    const index_path = try std.fs.path.join(allocator, &.{ export_dir, "index.html" });
+    defer allocator.free(index_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = index_path, .data = "<script src=\"./assets/app.js\"></script>" });
+    try std.testing.expectError(AppError.IoError, validateViewerExportFiles(allocator, export_dir));
+    const asset_path = try std.fs.path.join(allocator, &.{ export_dir, "assets", "app.js" });
+    defer allocator.free(asset_path);
+    try ensureParentDir(asset_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "console.log('ok');" });
+    try validateViewerExportFiles(allocator, export_dir);
+}
