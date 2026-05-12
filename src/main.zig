@@ -2544,7 +2544,8 @@ fn upsertTweetFromValue(db: *Db, allocator: std.mem.Allocator, tweet: std.json.V
     try bindText(stmt, 4, canonical);
     try bindText(stmt, 5, twitter);
     if (getString(tweet, "created_at")) |v| try bindText(stmt, 6, v) else _ = c.sqlite3_bind_null(stmt, 6);
-    if (getString(tweet, "text")) |v| try bindText(stmt, 7, v) else _ = c.sqlite3_bind_null(stmt, 7);
+    const stored_text = rawXPostText(tweet, getString(tweet, "text") orelse "");
+    if (stored_text.len > 0) try bindText(stmt, 7, stored_text) else _ = c.sqlite3_bind_null(stmt, 7);
     if (getString(tweet, "lang")) |v| try bindText(stmt, 8, v) else _ = c.sqlite3_bind_null(stmt, 8);
     if (getBool(tweet, "possibly_sensitive")) |v| _ = c.sqlite3_bind_int(stmt, 9, if (v) 1 else 0) else _ = c.sqlite3_bind_null(stmt, 9);
     try bindText(stmt, 10, raw);
@@ -4510,6 +4511,7 @@ fn buildRawXBookmarkMarkdown(
     try w.writeAll("---\n\n");
     try w.print("# X Bookmark: @{s} / {s}\n\n", .{ if (username.len > 0) username else "unknown", tweet_id });
     try w.writeAll("## Post\n\n");
+    try w.print("![]({s})\n\n", .{canonical_uri});
     if (post_text.len > 0) {
         try writeMarkdownEscaped(w, post_text);
         try w.writeAll("\n\n");
@@ -4950,6 +4952,10 @@ fn buildObsidianNote(
     raw_json: []const u8,
     asset_map: *std.StringHashMap([]const u8),
 ) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch null;
+    defer if (parsed) |*p| p.deinit();
+    const root = if (parsed) |p| p.value else null;
+    const post_text = rawXPostText(root, text);
     var out = std.ArrayList(u8).empty;
     const w = out.writer(allocator);
     const asset_error_count = try noteAssetErrorCount(db, tweet_id, author_id);
@@ -4974,7 +4980,8 @@ fn buildObsidianNote(
     if (asset_error_count > 0) try w.writeAll("  - x-bookmark/media-partial\n");
     try w.writeAll("---\n\n<!-- x-bookmarks:generated:start -->\n");
     try w.print("# @{s}\n\n", .{if (username.len > 0) username else "unknown"});
-    try writeMarkdownEscaped(w, text);
+    try w.print("![]({s})\n\n", .{canonical_uri});
+    try writeMarkdownEscaped(w, post_text);
     try w.writeAll("\n\n");
     try writeQuotePostsMarkdown(db, allocator, w, raw_json);
     try writeTweetMediaMarkdown(db, allocator, w, tweet_id, canonical_uri, asset_map);
@@ -7205,7 +7212,10 @@ test "full obsidian export is explicit and writes notes assets and diagnostic in
 
     const root = try std.fs.path.join(allocator, &.{ vault, "X Bookmarks" });
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "timeline", "2026", "2026-06.md" })));
-    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "bookmarks", "200.md" })));
+    const note_path = try std.fs.path.join(allocator, &.{ root, "bookmarks", "200.md" });
+    try std.testing.expect(fileExists(note_path));
+    const note = try std.fs.cwd().readFileAlloc(allocator, note_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, note, "![](https://x.com/bob/status/200)") != null);
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "assets", "images", "3_full-unhashed.jpg" })));
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "all-bookmarks.md" })));
     try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ root, "indexes", "failed-assets.md" })));
@@ -7273,6 +7283,7 @@ test "kb init and raw X export create agent-ingestable raw inbox" {
     const raw = try std.fs.cwd().readFileAlloc(allocator, raw_path, 1024 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, raw, "source_type: \"x_bookmark\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "status: \"inbox\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "![](https://x.com/alice/status/900)") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "Expanded long text") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "- Has external link(s).") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "- Quote-post present.") != null);
