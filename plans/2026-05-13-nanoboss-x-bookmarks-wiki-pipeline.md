@@ -113,8 +113,9 @@ The viable Nanoboss shape is:
 
 ```text
 Nanoboss procedure
+  -> typed agent call for natural-language intent extraction
   -> deterministic sync/export/select/context/lint/finalize steps
-  -> typed agent calls for triage and synthesis
+  -> typed agent calls for wiki synthesis and repair
   -> deterministic operation application
   -> child run/ref lineage captured by Nanoboss
 ```
@@ -143,6 +144,7 @@ not on Nanoboss internals.
 ```text
 X API / SQLite / raw bookmark export
   -> Nanoboss xbookmarks/wiki-refresh procedure
+  -> typed natural-language intent extraction
   -> deterministic batch/context builder
   -> typed downstream-agent synthesis
   -> deterministic operation applier
@@ -199,9 +201,9 @@ without forcing the `x-bookmarks` repo to become the Nanoboss monorepo.
 Initial commands:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true
-/xbookmarks/wiki-lint
-/xbookmarks/wiki-select-batch limit=25
+/xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks. Do not sync.
+/xbookmarks/wiki-lint Check the X bookmarks wiki for broken links and citation issues.
+/xbookmarks/wiki-select-batch Show me the next 25 exported bookmarks that would be processed.
 ```
 
 The implementation should keep most logic in plain TypeScript helper modules
@@ -254,20 +256,22 @@ Then invoke slash commands in the Nanoboss CLI.
 ### Main Procedure
 
 ```text
-/xbookmarks/wiki-refresh [options]
+/xbookmarks/wiki-refresh <natural-language request>
 ```
 
-`wiki-refresh` is the end-to-end pipeline. It can sync/export bookmarks, select
-a batch, build the context bundle, ask the configured downstream agent for a
-typed `WikiIngestPlan`, apply or dry-run the plan, lint the result, optionally
-repair lint failures, and return a typed procedure result.
+`wiki-refresh` is the end-to-end pipeline. It can ask the configured downstream
+agent to extract typed execution intent from the natural-language prompt,
+optionally sync/export bookmarks, select a batch, build the context bundle, ask
+the downstream agent for a typed `WikiIngestPlan`, apply or dry-run the plan,
+lint the result, optionally repair lint failures, and return a typed procedure
+result.
 
 ### Supporting Procedures
 
 ```text
-/xbookmarks/wiki-lint [options]
-/xbookmarks/wiki-select-batch [options]
-/xbookmarks/wiki-apply [options]
+/xbookmarks/wiki-lint <natural-language request>
+/xbookmarks/wiki-select-batch <natural-language request>
+/xbookmarks/wiki-apply <JSON plan request>
 ```
 
 Supporting procedures are mostly for debugging and test development:
@@ -280,21 +284,212 @@ Supporting procedures are mostly for debugging and test development:
   path. This should be considered an implementation helper, not the normal user
   entrypoint.
 
-### Parameter Reference
+### Human-Facing Input
 
-All parameters can be supplied as `key=value` tokens in the procedure prompt.
-Paths containing spaces should be quoted if the Nanoboss prompt parser requires
-it; examples below escape spaces with `\`.
+Human callers should use natural language, not a shell-style parameter list.
+This matches Nanoboss' procedure UX: the slash command chooses the procedure,
+and the prompt describes the user's intent.
+
+The first step in `wiki-refresh` should pass the user's natural-language prompt
+through `ctx.agent.run(...)` with a typed `RefreshIntent` schema. Deterministic
+code then validates the extracted intent, applies conservative defaults, and
+continues with sync/select/context/apply/lint.
+
+Intent extraction turns prompts like:
+
+```text
+Dry run the next 5 exported bookmarks. Do not sync.
+```
+
+into typed data like:
+
+```json
+{
+  "mode": "dry-run",
+  "syncMode": "none",
+  "limit": 5,
+  "repair": false,
+  "rationale": "The user asked for a dry run over already exported bookmarks.",
+  "confidence": "high"
+}
+```
+
+The v1 intent contract is:
+
+```ts
+type RefreshMode = "dry-run" | "apply";
+type SyncMode = "none" | "incremental" | "full";
+type IntentConfidence = "low" | "medium" | "high";
+
+interface RefreshIntent {
+  mode?: RefreshMode;
+  syncMode?: SyncMode;
+  limit?: number;
+  repair?: boolean;
+  maxRepairAttempts?: number;
+  batchId?: string;
+  rationale: string;
+  confidence: IntentConfidence;
+}
+```
+
+The deterministic procedure normalizes that to execution options:
+
+```ts
+interface RefreshOptions {
+  dryRun: boolean;
+  noSync: boolean;
+  fullSync: boolean;
+  limit: number;
+  repair: boolean;
+  maxRepairAttempts: number;
+  batchId: string;
+  changedOnly: boolean;
+  agent?: string;
+  intentRationale: string;
+  intentConfidence: IntentConfidence;
+}
+```
+
+Put these definitions in `.nanoboss/procedures/xbookmarks/lib/types.ts`.
+Implementation agents should not infer or redesign this shape during the first
+slice.
+
+Also define the rest of the procedure boundary types up front:
+
+```ts
+type LintSeverity = "error" | "warning";
+
+interface XBookmarksConfig {
+  workspaceRoot: string;
+  managedRoot: string;
+  artifactRoot: string;
+  xBookmarksBinary: string;
+}
+
+interface SelectedBookmark {
+  sourceId: string;
+  rawPath: string;
+  tweetId: string;
+  title: string;
+  contentHash: string;
+  authorHandle?: string;
+  postedAt?: string;
+  exportedAt?: string;
+  canonicalUrl?: string;
+}
+
+interface ContextBundle {
+  runId: string;
+  batchId: string;
+  rootPath: string;
+  runPath: string;
+  selectedBookmarksPath: string;
+  selectedRawSourcesPath: string;
+  schemaPath: string;
+  wikiIndexPath: string;
+  homePath?: string;
+  thisWeekPath?: string;
+  relevantMapPaths: string[];
+  candidateRelatedPagesPath: string;
+}
+
+type WikiOperation =
+  | { kind: "create_page"; path: string; markdown: string; sourceIds: string[] }
+  | { kind: "update_page"; path: string; markdown: string; sourceIds: string[] }
+  | { kind: "update_review"; path: string; markdown: string; sourceIds: string[] }
+  | { kind: "update_map"; path: string; markdown: string; sourceIds: string[] }
+  | { kind: "ignore_source"; sourceId: string; reason: string }
+  | { kind: "append_log"; markdown: string; sourceIds: string[] };
+
+interface WikiIngestPlan {
+  summary: string;
+  operations: WikiOperation[];
+  followUpSources: string[];
+  relationshipCandidates: string[];
+  spacedRepetitionCandidates: string[];
+}
+
+interface ApplyResult {
+  dryRun: boolean;
+  createdPages: string[];
+  updatedPages: string[];
+  updatedMaps: string[];
+  updatedReviewPages: string[];
+  ingestedSourceIds: string[];
+  ignoredSourceIds: string[];
+  unresolvedSourceIds: string[];
+  artifactPaths: string[];
+}
+
+interface LintFinding {
+  ruleId: string;
+  severity: LintSeverity;
+  file: string;
+  message: string;
+  line?: number;
+  suggestedFix?: string;
+}
+
+interface LintResult {
+  ok: boolean;
+  errorCount: number;
+  warningCount: number;
+  findings: LintFinding[];
+  artifactPaths: string[];
+}
+
+interface XBookmarksRefreshData {
+  intent: RefreshOptions;
+  config: Pick<XBookmarksConfig, "workspaceRoot" | "managedRoot" | "artifactRoot">;
+  selectedSourceIds: string[];
+  contextBundlePath: string;
+  applied: ApplyResult;
+  lint: LintResult;
+  followUpSources: string[];
+  relationshipCandidates: string[];
+  spacedRepetitionCandidates: string[];
+}
+```
+
+`SelectedBookmark` is metadata only. It is for stable batch identity, sorting,
+source ID validation, raw path resolution, display summaries, citation alias
+generation, and raw-source move decisions. Full post text should remain in the
+raw Markdown files and be exposed to the synthesis agent through
+`ContextBundle.selectedRawSourcesPath`.
+
+The procedure should choose safer defaults when intent is ambiguous:
+
+- default `limit` to `5` for refresh and `25` for selection;
+- default `dryRun` to `true` for v1 unless the prompt clearly asks to apply,
+  process, or write changes;
+- default `noSync` to `true` for v1 unless the prompt asks to sync, fetch, or
+  refresh from X;
+- default `fullSync` to `false` unless explicitly requested;
+- default repair to `false` in dry-run mode and `true` in apply mode;
+- cap `maxRepairAttempts` at `2`.
+
+Natural-language cues:
+
+- `dry run`, `preview`, `simulate`, `show me` -> `mode: "dry-run"`
+- `apply`, `write changes`, `process`, `commit to the wiki` -> `mode: "apply"`
+- `do not sync`, `from inbox`, `already exported` -> `syncMode: "none"`
+- `sync first`, `fetch latest`, `refresh from X` -> `syncMode: "incremental"`
+- `full sync`, `reconcile everything` -> `syncMode: "full"`
+- `no repair`, `do not auto-fix` -> `repair: false`
+- the first reasonable small integer -> `limit`
+
+### Programmatic Input
+
+Structured JSON is still useful for tests and procedure-to-procedure calls. It
+should be accepted when the prompt starts with `{`, and it should fail fast on
+unknown fields.
 
 | Parameter | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
 | `limit` | `wiki-refresh`, `wiki-select-batch` | `5` for refresh, `25` for select | Maximum raw inbox files to process. |
-| `noSync` | `wiki-refresh` | `false` | When `true`, skip X API sync and raw export; use existing inbox files. |
-| `dryRun` | `wiki-refresh`, `wiki-apply` | `false` | Build and validate changes without writing wiki/raw-source mutations. Artifacts may still be written under `artifactRoot`. |
-| `managedRoot` | all | config/env required | Managed Obsidian subtree, e.g. `/Users/jflam/src/brain2/X Bookmarks`. |
-| `workspaceRoot` | all | Nanoboss `ctx.cwd` | Procedure workspace and default base for relative artifact paths. |
-| `artifactRoot` | all | `.nanoboss/xbookmarks/runs` | Run artifact root, relative to `workspaceRoot` unless absolute. |
-| `xBookmarksBinary` | `wiki-refresh` when `noSync=false` | `zig-out/bin/x-bookmarks` under `workspaceRoot` | Importer binary to shell out to for sync/export. |
+| `noSync` | `wiki-refresh` | `true` for v1 | When `true`, skip X API sync and raw export; use existing inbox files. |
+| `dryRun` | `wiki-refresh`, `wiki-apply` | `true` for v1 | Build and validate changes without writing wiki/raw-source mutations. Artifacts may still be written under `artifactRoot`. |
 | `batchId` | `wiki-refresh`, `wiki-select-batch` | generated from run ID | Stable label for selected batch and artifacts. |
 | `agent` | `wiki-refresh` | Nanoboss session default | Optional downstream agent selection, if Nanoboss supports parsing it in procedure options. |
 | `repair` | `wiki-refresh` | `true` in apply mode, `false` in dry-run mode | Whether to ask the agent for a repair plan after lint failure. |
@@ -303,8 +498,20 @@ it; examples below escape spaces with `\`.
 | `changedOnly` | `wiki-refresh` sync/export step | `true` | Pass changed-only behavior to raw export when supported. |
 | `fullSync` | `wiki-refresh` sync step | `false` | Ask the importer to do a full sync instead of normal incremental sync. |
 
-Boolean parameters should accept `true` or `false`. Unknown parameters should
-fail fast with a clear error so typos do not silently change run behavior.
+Example programmatic call:
+
+```ts
+await ctx.procedures.run(
+  "xbookmarks/wiki-refresh",
+  JSON.stringify({
+    dryRun: true,
+    noSync: true,
+    limit: 5,
+  }),
+);
+```
+
+Boolean JSON fields should accept only booleans, not string values.
 
 ### Configuration Defaults
 
@@ -325,63 +532,52 @@ Store it at:
 .nanoboss/xbookmarks/config.json
 ```
 
-After that, normal invocations should not need `managedRoot=...`.
+After that, normal invocations should not include root paths, and the procedure
+should not document or encourage root paths in user prompts.
 
 ### Example Usage
 
 Inspect the next batch without syncing or writing wiki changes:
 
 ```text
-/xbookmarks/wiki-select-batch limit=5 managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-select-batch Show me the next 5 exported bookmarks that would be processed.
 ```
 
 Run the first safe end-to-end dry run:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true dryRun=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks. Do not sync.
 ```
 
 Apply a small already-exported inbox batch:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Process the next 5 exported bookmarks from the inbox.
 ```
 
 Sync/export first, then process the next 10 raw sources:
 
 ```text
-/xbookmarks/wiki-refresh limit=10 noSync=false managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
-```
-
-Use repo-local config and only pass the behavior flags:
-
-```text
-/xbookmarks/wiki-refresh limit=10 noSync=true dryRun=true
+/xbookmarks/wiki-refresh Sync first, then process about 10 bookmarks.
 ```
 
 Run lint only:
 
 ```text
-/xbookmarks/wiki-lint managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
-```
-
-Write artifacts to a temporary directory:
-
-```text
-/xbookmarks/wiki-refresh limit=5 noSync=true dryRun=true artifactRoot=/tmp/xbookmarks-runs managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-lint Check the X bookmarks wiki for broken links and citation issues.
 ```
 
 Run without repair so failures are exposed directly:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true repair=false managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks without auto-repair.
 ```
 
 Full sync before processing should be explicit because it may be slower and may
 hit X API limits:
 
 ```text
-/xbookmarks/wiki-refresh limit=25 noSync=false fullSync=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Full sync first, then process 25 bookmarks.
 ```
 
 ### Expected Output
@@ -416,13 +612,12 @@ Define two separate roots:
 
 Resolve configuration in this order:
 
-1. procedure prompt options, e.g. `managedRoot=...` and `workspaceRoot=...`;
-2. environment variables, e.g. `XBOOKMARKS_MANAGED_ROOT` and
+1. environment variables, e.g. `XBOOKMARKS_MANAGED_ROOT` and
    `XBOOKMARKS_WORKSPACE_ROOT`;
-3. a repo-local config file, e.g. `.nanoboss/xbookmarks/config.json`;
-4. the existing `x-bookmarks` config if it contains enough Obsidian root
+2. a repo-local config file, e.g. `.nanoboss/xbookmarks/config.json`;
+3. the existing `x-bookmarks` config if it contains enough Obsidian root
    information;
-5. fail with an actionable error.
+4. fail with an actionable error.
 
 Suggested config shape:
 
@@ -446,13 +641,31 @@ This keeps procedure artifacts, context snapshots, dry-run diffs, and lint JSON
 out of the human-facing Obsidian knowledge base. The agent can still receive
 those files as context, and the final wiki output remains under `managedRoot`.
 
+Do not require or encourage callers to pass `managedRoot`, `workspaceRoot`,
+`artifactRoot`, or `xBookmarksBinary` in normal procedure prompts. Those are
+configuration inputs, not user intent.
+
 Only write under `managedRoot` for actual wiki/raw-source changes. Only write
 under `artifactRoot` for run artifacts. Reject any operation that escapes those
 two roots.
 
 ## End-To-End Procedure Pipeline
 
-### 1. Sync And Raw Export
+### 1. Extract Execution Intent
+
+The human-facing prompt is natural language. Before doing sync, selection, or
+filesystem writes, call the configured downstream agent with a typed
+`RefreshIntent` schema.
+
+The intent agent should only extract execution options. It should not inspect
+bookmarks, draft wiki content, choose pages, or mutate files.
+
+The procedure then validates the extracted intent, applies conservative
+defaults, and records the final options in the run result. This gives humans a
+simple Nanoboss-style procedure surface while preserving deterministic typed
+execution.
+
+### 2. Sync And Raw Export
 
 Initial implementation shells out to the current Zig binary from a Nanoboss
 procedure:
@@ -466,7 +679,7 @@ The procedure records command, exit code, stdout, stderr, and resolved vault
 paths in the Nanoboss run output. If the command output is large, persist it as a
 ref instead of inventing a parallel run log.
 
-### 2. Select Stable Batch
+### 3. Select Stable Batch
 
 The pipeline selects raw files from the configured managed root:
 
@@ -482,9 +695,11 @@ Selection rules:
 - fixed `limit`;
 - return typed `SelectedBookmark[]` data from the selection helper.
 
-This gives the agent a fixed batch and makes retries understandable.
+This gives the procedure a fixed batch and makes retries understandable.
+`SelectedBookmark` should not include full post text; it is the metadata
+manifest for deterministic selection and validation.
 
-### 3. Build Context Bundle
+### 4. Build Context Bundle
 
 Before calling the agent, build a deterministic context bundle:
 
@@ -492,6 +707,7 @@ Before calling the agent, build a deterministic context bundle:
 <artifactRoot>/<run-id>/context/
   run.json
   selected-bookmarks.json
+  selected-raw-sources.md
   wiki-index.md
   schema.md
   home.md
@@ -500,6 +716,10 @@ Before calling the agent, build a deterministic context bundle:
   candidate-related-pages.json
 ```
 
+`selected-bookmarks.json` contains `SelectedBookmark[]` metadata.
+`selected-raw-sources.md` contains the selected raw Markdown contents for the
+synthesis agent.
+
 The first version can find related pages using fast text search over wiki page
 titles, aliases, source authors, extracted domains, hashtags, and simple
 keywords. Embeddings can wait.
@@ -507,36 +727,17 @@ keywords. Embeddings can wait.
 The context bundle path should also be returned as a Nanoboss ref or stored in
 the procedure result so later runs can inspect the exact input snapshot.
 
-### 4. Invoke Agent For Typed Operations
+### 5. Invoke Agent For Typed Operations
 
-Use `ctx.agent.run(...)` with a typed descriptor for the first version. The
-agent should return a structured operation plan, not edit files directly.
-
-The core typed output should be close to:
-
-```ts
-type WikiOperation =
-  | { kind: "create_page"; path: string; markdown: string; sourceIds: string[] }
-  | { kind: "update_page"; path: string; markdown: string; sourceIds: string[] }
-  | { kind: "update_review"; path: string; markdown: string; sourceIds: string[] }
-  | { kind: "update_map"; path: string; markdown: string; sourceIds: string[] }
-  | { kind: "ignore_source"; sourceId: string; reason: string }
-  | { kind: "append_log"; markdown: string };
-
-interface WikiIngestPlan {
-  summary: string;
-  operations: WikiOperation[];
-  followUpSources: string[];
-  relationshipCandidates: string[];
-  spacedRepetitionCandidates: string[];
-}
-```
+Use `ctx.agent.run(...)` with the `WikiIngestPlan` typed descriptor defined in
+`.nanoboss/procedures/xbookmarks/lib/types.ts`. The agent should return a
+structured operation plan, not edit files directly.
 
 The agent call should use the Nanoboss-configured downstream agent unless the
 caller explicitly overrides the agent selection. The pipeline should not depend
 on a provider-specific API.
 
-### 5. Agent Synthesis Responsibilities
+### 6. Agent Synthesis Responsibilities
 
 The agent should decide:
 
@@ -565,7 +766,7 @@ Logical agent roles, even if implemented as a single typed prompt at first:
 Avoid relying on autonomous sub-agent selection in the first version. Explicit
 procedure steps are easier to reason about and test.
 
-### 6. Deterministic Apply
+### 7. Deterministic Apply
 
 Apply the `WikiIngestPlan` with deterministic code:
 
@@ -594,7 +795,7 @@ Raw-source move policy is deterministic and not model-owned:
 - Reject any plan that both ignores and cites the same source.
 - Reject any `ignore_source` without a non-empty reason.
 
-### 7. Deterministic Lint
+### 8. Deterministic Lint
 
 After applying the plan, run a TypeScript linter over the changed wiki and
 selected raw sources.
@@ -625,7 +826,7 @@ human-readable artifacts:
 <artifactRoot>/<run-id>/lint.md
 ```
 
-### 8. Repair Loop
+### 9. Repair Loop
 
 If lint fails:
 
@@ -637,7 +838,7 @@ If lint fails:
 The procedure controls the loop. Agents do not decide when validation is good
 enough.
 
-### 9. Finalize
+### 10. Finalize
 
 Finalization returns typed procedure data and a concise display summary:
 
@@ -672,15 +873,22 @@ import {
 import {
   applyWikiPlan,
   buildContextBundle,
+  buildRefreshIntentPrompt,
   buildRepairPrompt,
   buildWikiIngestPrompt,
+  parseProgrammaticRefreshOptions,
   lintWiki,
-  parseRefreshOptions,
+  validateAndDefaultRefreshIntent,
   resolveXBookmarksConfig,
   selectBatch,
   syncAndExportRawX,
 } from "./lib";
-import type { WikiIngestPlan, XBookmarksRefreshData } from "./lib/types";
+import type { RefreshIntent, RefreshOptions, WikiIngestPlan, XBookmarksRefreshData } from "./lib/types";
+
+const RefreshIntentType = jsonType<RefreshIntent>(
+  typia.json.schema<RefreshIntent>(),
+  typia.createValidate<RefreshIntent>(),
+);
 
 const WikiIngestPlanType = jsonType<WikiIngestPlan>(
   typia.json.schema<WikiIngestPlan>(),
@@ -690,12 +898,21 @@ const WikiIngestPlanType = jsonType<WikiIngestPlan>(
 export default {
   name: "xbookmarks/wiki-refresh",
   description: "Compile X bookmark raw sources into the Obsidian wiki",
-  inputHint: "limit=5 noSync=true managedRoot=/path/to/X Bookmarks",
+  inputHint: "Example: Dry run the next 5 exported bookmarks. Do not sync.",
   async execute(prompt, ctx) {
-    const options = parseRefreshOptions(prompt);
+    const options: RefreshOptions = prompt.trim().startsWith("{")
+      ? parseProgrammaticRefreshOptions(prompt)
+      : validateAndDefaultRefreshIntent(expectData(
+        await ctx.agent.run(
+          buildRefreshIntentPrompt(prompt),
+          RefreshIntentType,
+          { stream: false },
+        ),
+        "Agent returned no refresh intent",
+      ));
+
     const config = await resolveXBookmarksConfig({
       cwd: ctx.cwd,
-      options,
     });
 
     if (!options.noSync) {
@@ -717,7 +934,7 @@ export default {
 
     ctx.ui.status({ phase: "synthesis", message: "Asking agent for wiki operations" });
     const planResult = await ctx.agent.run(
-      buildWikiIngestPrompt({ selected, context }),
+      buildWikiIngestPrompt({ selected, context, intent: options }),
       WikiIngestPlanType,
       {
         stream: false,
@@ -1042,18 +1259,20 @@ command. Do not strand the existing local archive.
 Build the smallest useful run:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true dryRun=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks. Do not sync.
 ```
 
 It should:
 
-1. read existing raw files from `raw/x/inbox`;
-2. select 5 files deterministically;
-3. build a context bundle;
-4. call `ctx.agent.run(...)` for a typed `WikiIngestPlan`;
-5. apply the plan in dry-run mode;
-6. run the link/citation linter;
-7. return typed procedure data and a concise summary.
+1. call `ctx.agent.run(...)` for a typed `RefreshIntent`;
+2. default the intent conservatively and record it in the run output;
+3. read existing raw files from `raw/x/inbox`;
+4. select 5 files deterministically;
+5. build a context bundle;
+6. call `ctx.agent.run(...)` for a typed `WikiIngestPlan`;
+7. apply the plan in dry-run mode;
+8. run the link/citation linter;
+9. return typed procedure data and a concise summary.
 
 Do not include X API sync in the first slice. Use already-exported raw files.
 Do not move raw files in the first dry-run slice.
@@ -1061,7 +1280,7 @@ Do not move raw files in the first dry-run slice.
 Second slice:
 
 ```text
-/xbookmarks/wiki-refresh limit=5 noSync=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+/xbookmarks/wiki-refresh Process the next 5 exported bookmarks from the inbox.
 ```
 
 That run may apply writes and raw-source moves after lint succeeds.
@@ -1075,7 +1294,7 @@ zig build test
 bun test
 nanoboss cli
 # then run /xbookmarks/wiki-lint
-# then run /xbookmarks/wiki-refresh limit=5 noSync=true dryRun=true managedRoot=/Users/jflam/src/brain2/X\ Bookmarks
+# then run /xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks. Do not sync.
 ```
 
 Acceptance criteria:
@@ -1132,8 +1351,9 @@ Implement the first thin vertical slice as a repo-scoped Nanoboss procedure:
 .nanoboss/procedures/xbookmarks/lib/...
 ```
 
-Start with `dryRun=true`, use `ctx.agent.run(...)` with the configured Nanoboss
-downstream agent, and require typed `WikiIngestPlan` output.
+Start with natural-language intent extraction to a typed `RefreshIntent`,
+default to dry-run behavior, use `ctx.agent.run(...)` with the configured
+Nanoboss downstream agent, and require typed `WikiIngestPlan` output.
 
 The highest-leverage first component is the linter. It makes the agentic layer
 trustworthy enough to iterate on the pipeline without repeatedly breaking the
