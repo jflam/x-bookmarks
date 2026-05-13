@@ -16,3 +16,10 @@ viewer/node_modules/
 viewer/dist/
 viewer/.vite/
 viewer/*.tsbuildinfo
+
+# Nanoboss procedure source is part of this repo.
+# Keep .nanoboss/procedures checked in; ignore generated run artifacts only.
+!.nanoboss/
+!.nanoboss/procedures/
+!.nanoboss/procedures/**
+.nanoboss/xbookmarks/runs/
