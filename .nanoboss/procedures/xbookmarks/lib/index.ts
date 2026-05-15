@@ -4,6 +4,7 @@ export * from "./intent.ts";
 export * from "./prompts.ts";
 export * from "./raw-source.ts";
 export * from "./review-builder.ts";
+export * from "./sensemaking.ts";
 export * from "./topic-synthesis.ts";
 export * from "./types.ts";
 export * from "./wiki-link-linter.ts";

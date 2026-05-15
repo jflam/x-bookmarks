@@ -35,6 +35,7 @@ export interface XBookmarksConfig {
   artifactRoot: string;
   xBookmarksBinary: string;
   xBookmarksHome?: string;
+  databasePath?: string;
 }
 
 export interface SelectedBookmark {
@@ -269,4 +270,67 @@ export interface CommandTranscript {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+export type SensemakingActionKind =
+  | "create_new_page"
+  | "add_evidence_to_page"
+  | "create_or_update_open_question"
+  | "defer_for_media_inspection"
+  | "ignore_low_signal";
+
+export interface SourceUnderstanding {
+  source_id: string;
+  source_kind: string;
+  main_claims: string[];
+  examples: string[];
+  people_or_orgs: string[];
+  domains: string[];
+  uncertainties: string[];
+  requires_media_inspection: boolean;
+}
+
+export interface MatchedInterest {
+  interest: string;
+  evidence: string;
+  confidence: "low" | "medium" | "high";
+}
+
+export interface NonObviousConnection {
+  connection: string;
+  related_pages: string[];
+}
+
+export interface SensemakingAction {
+  kind: SensemakingActionKind;
+  page?: string;
+  title?: string;
+  summary?: string;
+  evidence?: string;
+}
+
+export interface KbSensemakingDecision {
+  source_understanding: SourceUnderstanding;
+  why_saved: string;
+  matched_interests: MatchedInterest[];
+  non_obvious_connections: NonObviousConnection[];
+  durable_takeaways: string[];
+  candidate_pages: string[];
+  actions: SensemakingAction[];
+  confidence: "low" | "medium" | "high";
+  defer_reason?: string;
+}
+
+export interface BaselineBuildResult {
+  dryRun: boolean;
+  splitPath: string;
+  selectedSourceIds: string[];
+  processedSourceIds: string[];
+  decisionsStored: number;
+  sourcesDeferredForMediaInspection: string[];
+  sourcesIgnored: string[];
+  averageConfidence: string;
+  interestMapPath?: string;
+  runReportPath: string;
+  artifactPaths: string[];
 }

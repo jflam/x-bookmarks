@@ -1,5 +1,5 @@
 import { jsonType } from "./nanoboss.ts";
-import type { RefreshIntent, TopicSynthesisIntent, WikiIngestPlan, WikiOperation } from "./types.ts";
+import type { KbSensemakingDecision, RefreshIntent, TopicSynthesisIntent, WikiIngestPlan, WikiOperation } from "./types.ts";
 
 export const RefreshIntentType = jsonType<RefreshIntent>(
   {
@@ -54,6 +54,34 @@ export const TopicSynthesisIntentType = jsonType<TopicSynthesisIntent>(
   isTopicSynthesisIntent,
 );
 
+export const KbSensemakingDecisionType = jsonType<KbSensemakingDecision>(
+  {
+    type: "object",
+    required: [
+      "source_understanding",
+      "why_saved",
+      "matched_interests",
+      "non_obvious_connections",
+      "durable_takeaways",
+      "candidate_pages",
+      "actions",
+      "confidence",
+    ],
+    properties: {
+      source_understanding: { type: "object" },
+      why_saved: { type: "string" },
+      matched_interests: { type: "array" },
+      non_obvious_connections: { type: "array" },
+      durable_takeaways: { type: "array", items: { type: "string" } },
+      candidate_pages: { type: "array", items: { type: "string" } },
+      actions: { type: "array" },
+      confidence: { enum: ["low", "medium", "high"] },
+      defer_reason: { type: "string" },
+    },
+  },
+  isKbSensemakingDecision,
+);
+
 function isRefreshIntent(value: unknown): value is RefreshIntent {
   if (!isRecord(value)) return false;
   return (
@@ -93,6 +121,21 @@ function isTopicSynthesisIntent(value: unknown): value is TopicSynthesisIntent {
     && optionalString(value.batchId)
     && typeof value.rationale === "string"
     && enumValue(value.confidence, ["low", "medium", "high"])
+  );
+}
+
+function isKbSensemakingDecision(value: unknown): value is KbSensemakingDecision {
+  if (!isRecord(value)) return false;
+  return (
+    isRecord(value.source_understanding)
+    && typeof value.why_saved === "string"
+    && Array.isArray(value.matched_interests)
+    && Array.isArray(value.non_obvious_connections)
+    && Array.isArray(value.durable_takeaways)
+    && Array.isArray(value.candidate_pages)
+    && Array.isArray(value.actions)
+    && enumValue(value.confidence, ["low", "medium", "high"])
+    && optionalString(value.defer_reason)
   );
 }
 

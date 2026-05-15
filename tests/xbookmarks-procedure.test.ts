@@ -1,18 +1,22 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   applyWikiPlan,
+  applySensemakingDecision,
   buildReviewPages,
   buildContextBundle,
   lintWiki,
+  refreshInterestMap,
   selectBatch,
 } from "../.nanoboss/procedures/xbookmarks/lib/index.ts";
 import wikiRefresh from "../.nanoboss/procedures/xbookmarks/wiki-refresh.ts";
+import wikiBaselineBuild from "../.nanoboss/procedures/xbookmarks/wiki-baseline-build.ts";
 import wikiTopicSynthesisRefresh from "../.nanoboss/procedures/xbookmarks/wiki-topic-synthesis-refresh.ts";
-import type { WikiIngestPlan, XBookmarksConfig } from "../.nanoboss/procedures/xbookmarks/lib/types.ts";
+import type { KbSensemakingDecision, WikiIngestPlan, XBookmarksConfig } from "../.nanoboss/procedures/xbookmarks/lib/types.ts";
 
 test("selects, previews, lints, and applies a raw X bookmark plan", async () => {
   const { config, managedRoot } = await createFixtureWiki();
@@ -424,6 +428,79 @@ test("topic synthesis refresh all mode chunks topics under procedure control", a
   expect(calls.length).toBe(2);
 });
 
+test("sensemaking decision renders into source file and stores SQLite state", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  const result = await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-sensemaking",
+  });
+
+  expect(result.stored).toBe(true);
+  const raw = await readFile(join(managedRoot, "raw", "x", "inbox", "123.md"), "utf8");
+  expect(raw).toContain("## Ingest Decision");
+  expect(raw).toContain("Why likely saved: John likely saved this because it names eval loops");
+
+  const db = new Database(config.databasePath!);
+  const row = db.query("SELECT status, why_saved, confidence FROM kb_ingest_decisions WHERE source_id = '123'").get() as Record<string, string>;
+  expect(row.status).toBe("processed");
+  expect(row.confidence).toBe("high");
+  db.close();
+});
+
+test("interest map refresh groups matched interests from stored decisions", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-map",
+  });
+
+  const mapPath = await refreshInterestMap(config, "fixture");
+  const map = await readFile(mapPath, "utf8");
+  expect(map).toContain("### Agent Harness Evaluation");
+  expect(map).toContain("[123](../../raw/x/inbox/123.md)");
+});
+
+test("baseline build previews selected split sources without storing decisions", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const splitPath = join(managedRoot, "wiki", "meta", "corpus-split.json");
+  await mkdir(join(managedRoot, "wiki", "meta"), { recursive: true });
+  await writeFile(splitPath, JSON.stringify({
+    baseline_100: ["123"],
+    baseline_100_sources: [{ source_id: "123", raw_path: "raw/x/inbox/123.md" }],
+  }), "utf8");
+
+  const calls: string[] = [];
+  const result = await wikiBaselineBuild.execute("--split wiki/meta/corpus-split.json --limit 1 --dry-run", {
+    cwd: config.workspaceRoot,
+    assertNotCancelled() {},
+    ui: { status() {} },
+    agent: {
+      async run(prompt, descriptor) {
+        calls.push(prompt);
+        const data = fixtureDecision();
+        if (!descriptor.validate(data)) throw new Error("fixture agent returned invalid typed data");
+        return { data };
+      },
+    },
+  });
+
+  expect(typeof result).toBe("object");
+  if (!result || typeof result !== "object" || !("data" in result)) throw new Error("missing procedure data");
+  const data = result.data as { processedSourceIds: string[]; decisionsStored: number; runReportPath: string };
+  expect(data.processedSourceIds).toEqual(["123"]);
+  expect(data.decisionsStored).toBe(0);
+  expect(await readFile(data.runReportPath, "utf8")).toContain("Sources processed: 1");
+  expect(calls.length).toBe(1);
+});
+
 
 async function createFixtureWiki(): Promise<{ config: XBookmarksConfig; managedRoot: string }> {
   const root = await mkdtemp(join(tmpdir(), "xbookmarks-procedure-"));
@@ -433,6 +510,7 @@ async function createFixtureWiki(): Promise<{ config: XBookmarksConfig; managedR
     managedRoot,
     artifactRoot: join(root, ".nanoboss", "xbookmarks", "runs"),
     xBookmarksBinary: join(root, "x-bookmarks"),
+    databasePath: join(root, "x_bookmarks.sqlite"),
   };
 
   await mkdir(join(managedRoot, "raw", "x", "inbox"), { recursive: true });
@@ -537,6 +615,46 @@ function rawBookmark(): string {
     "- 3_123 (photo): `/tmp/agent-harness-chart.jpg` (image, downloaded)",
     "",
   ].join("\n");
+}
+
+function fixtureDecision(): KbSensemakingDecision {
+  return {
+    source_understanding: {
+      source_id: "123",
+      source_kind: "x_post",
+      main_claims: ["Agent harnesses need durable eval loops."],
+      examples: ["A short X post about agent harness design."],
+      people_or_orgs: ["alice"],
+      domains: ["agentic software", "evaluation"],
+      uncertainties: [],
+      requires_media_inspection: false,
+    },
+    why_saved: "John likely saved this because it names eval loops as the control layer around agentic coding.",
+    matched_interests: [
+      {
+        interest: "agent harness evaluation",
+        evidence: "The source argues for durable eval loops in agent harnesses.",
+        confidence: "high",
+      },
+    ],
+    non_obvious_connections: [
+      {
+        connection: "The bookmark treats evals as operational harness design, not only model benchmarking.",
+        related_pages: ["wiki/concepts/agent-harness-eval-loops.md"],
+      },
+    ],
+    durable_takeaways: ["Agent tools need repeatable review loops around their output."],
+    candidate_pages: ["wiki/concepts/agent-harness-eval-loops.md"],
+    actions: [
+      {
+        kind: "add_evidence_to_page",
+        page: "wiki/concepts/agent-harness-eval-loops.md",
+        title: "Agent Harness Eval Loops",
+        evidence: "Agent harnesses need durable eval loops.",
+      },
+    ],
+    confidence: "high",
+  };
 }
 
 function fixturePlan(): WikiIngestPlan {

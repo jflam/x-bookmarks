@@ -434,6 +434,10 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] kb init
         \\  x-bookmarks [--config PATH] [--home PATH] kb export-raw-x [--changed]
         \\  x-bookmarks [--config PATH] [--home PATH] kb status
+        \\  x-bookmarks [--config PATH] [--home PATH] kb corpus-split --baseline N --reserve-recent N --write PATH
+        \\  x-bookmarks [--config PATH] [--home PATH] kb reset-semantic-wiki --dry-run|--yes
+        \\  x-bookmarks [--config PATH] [--home PATH] kb source-status --source PATH
+        \\  x-bookmarks [--config PATH] [--home PATH] kb sensemaking-context --source PATH
         \\  x-bookmarks [--config PATH] [--home PATH] threads detect [--changed]
         \\  x-bookmarks [--config PATH] [--home PATH] threads expand --tweet-id TWEET_ID [--dry-run] [--user-timeline|--search-recent|--search-all|--auto] [--max-results N] [--max-posts N] [--yes]
         \\  x-bookmarks [--config PATH] [--home PATH] threads expand --changed [--dry-run] [--limit N] [--user-timeline|--search-recent|--search-all|--auto]
@@ -1181,6 +1185,87 @@ fn commandKb(rt: *Runtime) !void {
         var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
         defer paths.deinit(rt.allocator);
         try kbStatus(&db, rt.allocator, paths);
+    } else if (std.mem.eql(u8, sub, "corpus-split")) {
+        var baseline: u32 = 0;
+        var reserve_recent: u32 = 0;
+        var write_path: ?[]const u8 = null;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--baseline")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                baseline = try parseU32Arg(rt.args[i]);
+            } else if (std.mem.eql(u8, rt.args[i], "--reserve-recent")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                reserve_recent = try parseU32Arg(rt.args[i]);
+            } else if (std.mem.eql(u8, rt.args[i], "--write")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                write_path = rt.args[i];
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (baseline == 0 or write_path == null) return AppError.InvalidArguments;
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbCorpusSplit(&db, rt.allocator, paths, baseline, reserve_recent, write_path.?);
+    } else if (std.mem.eql(u8, sub, "reset-semantic-wiki")) {
+        var dry_run = false;
+        var yes = false;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, rt.args[i], "--yes")) {
+                yes = true;
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (dry_run == yes) return AppError.InvalidArguments;
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbResetSemanticWiki(rt.allocator, paths, dry_run);
+    } else if (std.mem.eql(u8, sub, "source-status")) {
+        var source: ?[]const u8 = null;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--source")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                source = rt.args[i];
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (source == null) return AppError.InvalidArguments;
+        var db = try Db.open(cfg.database_path, rt.allocator);
+        defer db.close();
+        try applyMigrations(&db);
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbSourceStatus(&db, rt.allocator, paths, source.?);
+    } else if (std.mem.eql(u8, sub, "sensemaking-context")) {
+        var source: ?[]const u8 = null;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--source")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                source = rt.args[i];
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if (source == null) return AppError.InvalidArguments;
+        var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
+        defer paths.deinit(rt.allocator);
+        try kbSensemakingContext(rt.allocator, paths, source.?);
     } else {
         return AppError.InvalidCommand;
     }
@@ -2004,6 +2089,28 @@ fn applyMigrations(db: *Db) !void {
         \\  detected_at TEXT NOT NULL,
         \\  reason_json TEXT NOT NULL,
         \\  status TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS kb_ingest_decisions (
+        \\  source_id TEXT PRIMARY KEY,
+        \\  raw_path TEXT NOT NULL,
+        \\  status TEXT NOT NULL,
+        \\  why_saved TEXT,
+        \\  matched_interests_json TEXT,
+        \\  non_obvious_connections_json TEXT,
+        \\  candidate_pages_json TEXT,
+        \\  actions_json TEXT,
+        \\  confidence TEXT,
+        \\  defer_reason TEXT,
+        \\  created_at TEXT NOT NULL,
+        \\  updated_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS kb_interest_map_revisions (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  revision_label TEXT,
+        \\  markdown_path TEXT NOT NULL,
+        \\  summary_json TEXT,
+        \\  source_count INTEGER NOT NULL DEFAULT 0,
+        \\  created_at TEXT NOT NULL
         \\);
         \\CREATE INDEX IF NOT EXISTS idx_bookmark_items_last_seen ON bookmark_items(account_user_id, last_seen_run_id);
         \\CREATE INDEX IF NOT EXISTS idx_media_assets_status ON media_assets(status);
@@ -5357,6 +5464,261 @@ fn kbStatus(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths) !void {
     try out.print("raw x ingested: {}\n", .{try countFilesWithSuffix(allocator, ingested, ".md")});
     try out.print("raw x ignored: {}\n", .{try countFilesWithSuffix(allocator, ignored, ".md")});
     try out.print("wiki pages: {}\n", .{try countMarkdownFilesRecursive(allocator, wiki)});
+}
+
+const KbSplitItem = struct {
+    tweet_id: []const u8,
+    raw_path: []const u8,
+
+    fn deinit(self: KbSplitItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.tweet_id);
+        allocator.free(self.raw_path);
+    }
+};
+
+fn kbCorpusSplit(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, baseline_count: u32, reserve_recent_count: u32, write_arg: []const u8) !void {
+    try makeKbDirs(allocator, paths);
+    var all = std.ArrayList(KbSplitItem).empty;
+    defer {
+        for (all.items) |item| item.deinit(allocator);
+        all.deinit(allocator);
+    }
+
+    const stmt = try db.prepare(
+        \\SELECT b.tweet_id
+        \\FROM bookmark_items b
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.last_seen_at DESC, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        const tweet_id = colText(stmt, 0);
+        const raw_path = try kbResolveRawSourceForId(allocator, paths, tweet_id);
+        try all.append(allocator, .{
+            .tweet_id = try allocator.dupe(u8, tweet_id),
+            .raw_path = raw_path,
+        });
+    }
+
+    const total = all.items.len;
+    const reserve_end = @min(total, reserve_recent_count);
+    const older_count = if (total > reserve_end) total - reserve_end else 0;
+    const baseline_take = @min(older_count, baseline_count);
+    const baseline_start = total - baseline_take;
+
+    const write_path = try kbResolveOutputPath(allocator, paths, write_arg);
+    defer allocator.free(write_path);
+    try ensureParentDir(write_path);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    const generated = try timestampString(allocator);
+    defer allocator.free(generated);
+    try w.writeAll("{\n");
+    try w.print("  \"generated_at\": {f},\n", .{std.json.fmt(generated, .{})});
+    try w.print("  \"total_active_bookmark_count\": {},\n", .{total});
+    try w.print("  \"reserve_recent_count\": {},\n", .{reserve_recent_count});
+    try w.print("  \"baseline_count\": {},\n", .{baseline_count});
+    try w.print("  \"ordering_rule\": {f},\n", .{std.json.fmt("active bookmarks ordered by import_position ascending, last_seen_at descending, tweet_id descending; recent holdout is first N; baseline_100 is oldest N among the remaining older corpus", .{})});
+    try w.writeAll("  \"reserved_recent_holdout\": ");
+    try writeSplitIdsJson(w, all.items[0..reserve_end]);
+    try w.writeAll(",\n  \"baseline_100\": ");
+    try writeSplitIdsJson(w, all.items[baseline_start..total]);
+    try w.writeAll(",\n  \"baseline_100_sources\": ");
+    try writeSplitSourcesJson(w, paths.root, all.items[baseline_start..total]);
+    try w.writeAll(",\n  \"skipped_deferred\": []\n}\n");
+    try std.fs.cwd().writeFile(.{ .sub_path = write_path, .data = out.items });
+    try std.fs.File.stdout().deprecatedWriter().print("wrote corpus split: {s} total={} holdout={} baseline={}\n", .{ write_path, total, reserve_end, baseline_take });
+}
+
+fn writeSplitIdsJson(writer: anytype, items: []const KbSplitItem) !void {
+    try writer.writeAll("[");
+    for (items, 0..) |item, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writer.print("{f}", .{std.json.fmt(item.tweet_id, .{})});
+    }
+    try writer.writeAll("]");
+}
+
+fn writeSplitSourcesJson(writer: anytype, root: []const u8, items: []const KbSplitItem) !void {
+    try writer.writeAll("[\n");
+    for (items, 0..) |item, index| {
+        if (index > 0) try writer.writeAll(",\n");
+        try writer.writeAll("    {");
+        try writer.print("\"source_id\": {f}, ", .{std.json.fmt(item.tweet_id, .{})});
+        try writer.print("\"raw_path\": {f}", .{std.json.fmt(relativeToRoot(root, item.raw_path), .{})});
+        try writer.writeAll("}");
+    }
+    if (items.len > 0) try writer.writeAll("\n  ");
+    try writer.writeAll("]");
+}
+
+fn kbResetSemanticWiki(allocator: std.mem.Allocator, paths: ObsidianPaths, dry_run: bool) !void {
+    const dirs = [_][]const u8{
+        "wiki/concepts",
+        "wiki/people",
+        "wiki/projects",
+        "wiki/tools",
+        "wiki/papers",
+        "wiki/companies",
+        "wiki/questions",
+        "wiki/syntheses",
+        "wiki/maps",
+        "wiki/outputs",
+    };
+    const files = [_][]const u8{
+        "wiki/index.md",
+        "wiki/log.md",
+        "wiki/meta/interest-map.md",
+        "wiki/meta/corpus-split.json",
+    };
+    const out = std.fs.File.stdout().deprecatedWriter();
+    for (dirs) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ paths.root, rel });
+        defer allocator.free(path);
+        if (dry_run) {
+            try out.print("would reset directory: {s}\n", .{path});
+        } else {
+            if (fileExists(path)) try std.fs.cwd().deleteTree(path);
+            try std.fs.cwd().makePath(path);
+            try out.print("reset directory: {s}\n", .{path});
+        }
+    }
+    for (files) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ paths.root, rel });
+        defer allocator.free(path);
+        if (dry_run) {
+            try out.print("would remove generated file: {s}\n", .{path});
+        } else {
+            std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+    if (!dry_run) {
+        const index_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "index.md" });
+        defer allocator.free(index_path);
+        const log_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "log.md" });
+        defer allocator.free(log_path);
+        try writeFileIfMissing(index_path, kbIndexStarter);
+        try writeFileIfMissing(log_path, kbLogStarter);
+    }
+}
+
+fn kbSourceStatus(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, source_arg: []const u8) !void {
+    const source_path = try kbResolveSourceArg(allocator, paths, source_arg);
+    defer allocator.free(source_path);
+    const source_id = try kbSourceIdFromPathOrFrontmatter(allocator, source_path);
+    defer allocator.free(source_id);
+    const file_status = try kbFrontmatterValue(allocator, source_path, "status");
+    defer if (file_status) |value| allocator.free(value);
+
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("source_id: {s}\nraw_path: {s}\nfile_status: {s}\n", .{ source_id, source_path, file_status orelse "unknown" });
+    const stmt = try db.prepare(
+        \\SELECT status, coalesce(why_saved, ''), coalesce(confidence, ''), coalesce(defer_reason, ''), updated_at
+        \\FROM kb_ingest_decisions
+        \\WHERE source_id = ?
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, source_id);
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        try out.print("decision_status: {s}\nwhy_saved: {s}\nconfidence: {s}\ndefer_reason: {s}\nupdated_at: {s}\n", .{
+            colText(stmt, 0),
+            colText(stmt, 1),
+            colText(stmt, 2),
+            colText(stmt, 3),
+            colText(stmt, 4),
+        });
+    } else {
+        try out.writeAll("decision_status: missing\n");
+    }
+}
+
+fn kbSensemakingContext(allocator: std.mem.Allocator, paths: ObsidianPaths, source_arg: []const u8) !void {
+    const source_path = try kbResolveSourceArg(allocator, paths, source_arg);
+    defer allocator.free(source_path);
+    const source = try std.fs.cwd().readFileAlloc(allocator, source_path, 8 * 1024 * 1024);
+    defer allocator.free(source);
+    const interest_map_path = try std.fs.path.join(allocator, &.{ paths.root, "wiki", "meta", "interest-map.md" });
+    defer allocator.free(interest_map_path);
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("# Sensemaking Context\n\nSource: {s}\n\n## Current Interest Map\n\n", .{source_path});
+    if (fileExists(interest_map_path)) {
+        const map = try std.fs.cwd().readFileAlloc(allocator, interest_map_path, 2 * 1024 * 1024);
+        defer allocator.free(map);
+        try out.writeAll(map);
+    } else {
+        try out.writeAll("_No interest map exists yet._\n");
+    }
+    try out.writeAll("\n\n## Source Markdown\n\n");
+    try out.writeAll(source);
+}
+
+fn kbResolveRawSourceForId(allocator: std.mem.Allocator, paths: ObsidianPaths, source_id: []const u8) ![]const u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{source_id});
+    defer allocator.free(filename);
+    for ([_][]const u8{ "inbox", "ingested", "ignored" }) |bucket| {
+        const path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", bucket, filename });
+        if (fileExists(path)) return path;
+        allocator.free(path);
+    }
+    return std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", filename });
+}
+
+fn kbResolveSourceArg(allocator: std.mem.Allocator, paths: ObsidianPaths, source_arg: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(source_arg)) return allocator.dupe(u8, source_arg);
+    return std.fs.path.join(allocator, &.{ paths.root, source_arg });
+}
+
+fn kbResolveOutputPath(allocator: std.mem.Allocator, paths: ObsidianPaths, path_arg: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path_arg)) return allocator.dupe(u8, path_arg);
+    return std.fs.path.join(allocator, &.{ paths.root, path_arg });
+}
+
+fn kbSourceIdFromPathOrFrontmatter(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (try kbFrontmatterValue(allocator, path, "tweet_id")) |value| return value;
+    return basenameNoExt(allocator, path);
+}
+
+fn kbFrontmatterValue(allocator: std.mem.Allocator, path: []const u8, key: []const u8) !?[]const u8 {
+    const text = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(text);
+    if (!std.mem.startsWith(u8, text, "---\n")) return null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    _ = it.next();
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, line, "---")) break;
+        if (std.mem.indexOfScalar(u8, line, ':')) |idx| {
+            const name = std.mem.trim(u8, line[0..idx], " \t");
+            if (!std.mem.eql(u8, name, key)) continue;
+            var value = std.mem.trim(u8, line[idx + 1 ..], " \t\"");
+            if (std.mem.endsWith(u8, value, "\"")) value = value[0 .. value.len - 1];
+            const owned = try allocator.dupe(u8, value);
+            return owned;
+        }
+    }
+    return null;
+}
+
+fn basenameNoExt(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const base = std.fs.path.basename(path);
+    if (std.mem.endsWith(u8, base, ".md")) return allocator.dupe(u8, base[0 .. base.len - 3]);
+    return allocator.dupe(u8, base);
+}
+
+fn relativeToRoot(root: []const u8, path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, path, root)) {
+        var rel = path[root.len..];
+        if (std.mem.startsWith(u8, rel, "/")) rel = rel[1..];
+        return rel;
+    }
+    return path;
 }
 
 fn countMarkdownFilesRecursive(allocator: std.mem.Allocator, root: []const u8) !i64 {

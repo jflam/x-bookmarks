@@ -74,6 +74,43 @@ export function buildRepairPrompt(params: {
   ].join("\n");
 }
 
+export function buildSensemakingPrompt(params: {
+  sourceId: string;
+  sourcePath: string;
+  sourceMarkdown: string;
+  interestMapMarkdown: string;
+  candidatePages: Array<{ path: string; title?: string; excerpt?: string }>;
+}): string {
+  return [
+    "You are doing phase-one interest-aware X bookmark sensemaking.",
+    "Answer the product question: why did John likely save this, and what does it connect to?",
+    "",
+    "Ground all source understanding in the source markdown only. Use the interest map and candidate pages only for matching and connection context.",
+    "Do not force a connection. It is valid to say you do not know why this was saved, that it is low-signal, that media inspection is required, or that it should wait for later synthesis.",
+    "",
+    "Return only typed JSON matching the provided schema.",
+    "",
+    "The visible reasoning must include these conceptual sections in the JSON fields:",
+    "## Source Understanding",
+    "## Why John Likely Saved This",
+    "## Existing Interest Matches",
+    "## Non-Obvious Connections",
+    "## Durable Takeaways",
+    "## Proposed Actions",
+    "## Confidence And Deferrals",
+    "",
+    "Allowed action kinds: create_new_page, add_evidence_to_page, create_or_update_open_question, defer_for_media_inspection, ignore_low_signal.",
+    "For image-primary, video-primary, chart, or screenshot sources where text is insufficient, set source_understanding.requires_media_inspection true and include defer_reason.",
+    "",
+    "Current source:",
+    JSON.stringify({ sourceId: params.sourceId, sourcePath: params.sourcePath }, null, 2),
+    "",
+    markdownBlock("interest-map.md", params.interestMapMarkdown || "_No interest map exists yet._"),
+    jsonBlock("candidate-pages.json", JSON.stringify(params.candidatePages, null, 2)),
+    markdownBlock("source.md", params.sourceMarkdown),
+  ].join("\n");
+}
+
 function readPromptModule(name: string): string {
   for (const candidate of [
     join(PROMPT_DIR, name),

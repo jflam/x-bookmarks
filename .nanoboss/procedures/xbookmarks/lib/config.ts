@@ -17,6 +17,8 @@ export async function resolveXBookmarksConfig(options: ConfigResolutionOptions):
   const dataConfig = await readJsonObject(dataConfigPath);
   const rootConfig = dataConfig ? undefined : await readJsonObject(rootConfigPath);
   const existingConfig = dataConfig ?? rootConfig;
+  const storage = recordValue(existingConfig?.storage);
+  const databasePath = stringValue(storage?.database_path);
 
   const workspaceRoot = resolveMaybeRelative(
     cwd,
@@ -64,6 +66,9 @@ export async function resolveXBookmarksConfig(options: ConfigResolutionOptions):
     artifactRoot,
     xBookmarksBinary,
     xBookmarksHome,
+    databasePath: databasePath
+      ? resolveMaybeRelative(dataConfig ? resolveMaybeRelative(workspaceRoot, "data") : workspaceRoot, databasePath)
+      : undefined,
   };
 }
 
