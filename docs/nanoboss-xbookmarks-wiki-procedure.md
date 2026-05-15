@@ -11,6 +11,9 @@ ingested or ignored.
 Implementation contracts and internal type definitions live in
 [the implementation plan](../plans/2026-05-13-nanoboss-x-bookmarks-wiki-pipeline.md).
 
+For a fuller operator and reviewer guide with examples for every procedure, see
+[`nanoboss-xbookmarks-procedures-guide.md`](nanoboss-xbookmarks-procedures-guide.md).
+
 ## Architecture
 
 ```mermaid
@@ -22,6 +25,10 @@ flowchart TD
   Config --> Wiki["Obsidian X Bookmarks wiki"]
   Config --> Runs["Run artifacts"]
 
+  Refresh --> Intent["Typed intent extraction agent"]
+  Intent --> Options["Validated refresh options"]
+  Options --> Import
+
   Refresh --> Import["Optional bookmark sync/export"]
   Import --> Inbox["raw/x/inbox"]
   Inbox --> Batch["Selected bookmark batch"]
@@ -29,8 +36,10 @@ flowchart TD
   Wiki --> Context
   Context --> Draft["Agent-generated wiki plan"]
   Draft --> Apply["Preview or apply changes"]
-  Apply --> Lint["Link and citation checks"]
-  Lint --> Summary["Nanoboss result summary"]
+  Apply --> Lint["Link, citation, and plan checks"]
+  Lint --> Repair{"Repair enabled and needed?"}
+  Repair -->|yes| Draft
+  Repair -->|no| Summary["Nanoboss result summary"]
 ```
 
 ## Sequence
@@ -46,20 +55,28 @@ sequenceDiagram
 
   U->>NB: /xbookmarks/wiki-refresh Dry run the next 5 exported bookmarks. Do not sync.
   NB->>P: Start procedure
-  P->>P: Interpret request and resolve config
+  P->>A: Extract typed RefreshIntent
+  A-->>P: RefreshIntent JSON
+  P->>P: Validate/default options and resolve config
   alt user asked to sync
     P->>X: Sync/export bookmarks
     X->>W: Write raw sources to inbox
   end
   P->>W: Select raw inbox batch
+  P->>P: Build context bundle under artifactRoot
   P->>A: Ask for wiki update plan
-  A-->>P: Proposed changes
+  A-->>P: WikiIngestPlan JSON
   alt dry run
-    P->>NB: Report proposed changes
+    P->>P: Preview operations and write artifacts
   else apply
     P->>W: Write wiki updates and move raw sources
   end
-  P->>W: Check links and citations
+  P->>W: Check links, citations, source status, and plan completeness
+  opt apply mode with repair enabled and lint failed
+    P->>A: Ask for narrow repair plan
+    A-->>P: Replacement WikiIngestPlan JSON
+    P->>W: Re-apply and re-lint
+  end
   P-->>NB: Return summary and artifact paths
   NB-->>U: Show result
 ```
@@ -86,6 +103,7 @@ Example:
   "workspaceRoot": "/Users/jflam/src/x-bookmarks",
   "managedRoot": "/Users/jflam/src/brain2/X Bookmarks",
   "xBookmarksBinary": "/Users/jflam/src/x-bookmarks/zig-out/bin/x-bookmarks",
+  "xBookmarksHome": "/Users/jflam/src/x-bookmarks/data",
   "artifactRoot": ".nanoboss/xbookmarks/runs"
 }
 ```
@@ -106,6 +124,9 @@ Supporting workflows:
 ```text
 /xbookmarks/wiki-select-batch <natural-language request>
 /xbookmarks/wiki-lint <natural-language request>
+/xbookmarks/wiki-apply <JSON plan request>
+/xbookmarks/wiki-build-reviews <natural-language request>
+/xbookmarks/wiki-topic-synthesis-refresh <natural-language request>
 ```
 
 Human-facing prompts should be natural language. Use small batches until the
@@ -149,6 +170,31 @@ Check the wiki without processing a batch:
 /xbookmarks/wiki-lint Check the X bookmarks wiki for broken links and citation issues.
 ```
 
+Build deterministic weekly review source-trail pages from processed sources:
+
+```text
+/xbookmarks/wiki-build-reviews Build dry-run review pages for the latest 8 weeks.
+```
+
+Refresh existing topic pages using their cited sources and media:
+
+```text
+/xbookmarks/wiki-topic-synthesis-refresh Dry run synthesis refresh for wiki/concepts/autonomous-driving-perception.md.
+```
+
+Apply a bounded topic synthesis pass for pages that look mechanically repaired
+and need deeper analysis:
+
+```text
+/xbookmarks/wiki-topic-synthesis-refresh Apply synthesis refresh for the next 3 topics.
+```
+
+Stress-test the entire topic wiki under procedural control:
+
+```text
+/xbookmarks/wiki-topic-synthesis-refresh Apply synthesis refresh for all topic pages in chunks of 5.
+```
+
 Disable automatic repair for a preview:
 
 ```text
@@ -166,6 +212,12 @@ Use words like these to steer the run:
 - `sync first` or `fetch latest` to refresh from X before selecting a batch.
 - `full sync` only when you explicitly want a slower reconciliation run.
 - Include a small number such as `5` or `10` to set the batch size.
+- For topic synthesis, include explicit topic paths when you want a specific
+  page refreshed. Otherwise the procedure selects high-priority mechanically
+  repaired pages first.
+- For topic synthesis, `all topic pages` or `everything` enables the procedure's
+  deterministic all-mode loop. `chunks of N` controls how many topic pages are
+  sent to each agent call.
 
 When the request is ambiguous, the procedure should choose the safer behavior:
 small batch, no sync, and dry-run.
@@ -181,6 +233,15 @@ small batch, no sync, and dry-run.
 - raw sources that would be or were ingested or ignored;
 - lint status;
 - repair attempts, if any;
+- follow-up sources, relationship candidates, and spaced-repetition candidates.
+
+`wiki-topic-synthesis-refresh` should show:
+
+- which topic pages were selected;
+- whether all-mode was used, the chunk size, and chunks completed;
+- the context bundle path containing topic pages, raw sources, and media notes;
+- pages that would be or were updated;
+- lint status;
 - follow-up sources, relationship candidates, and spaced-repetition candidates.
 
 Run artifacts are written under:

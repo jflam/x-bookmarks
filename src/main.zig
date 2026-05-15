@@ -20,11 +20,101 @@ const AppError = error{
 
 const default_scopes = "tweet.read users.read bookmark.read offline.access";
 const x_api_base = "https://api.x.com/2";
-const bookmark_tweet_fields = "id,text,author_id,created_at,conversation_id,display_text_range,entities,context_annotations,attachments,referenced_tweets,public_metrics,lang,possibly_sensitive,source,note_tweet,card_uri,article";
+const bookmark_tweet_fields = "id,text,author_id,created_at,conversation_id,in_reply_to_user_id,display_text_range,entities,context_annotations,attachments,referenced_tweets,public_metrics,lang,possibly_sensitive,source,note_tweet,card_uri,article";
 const bookmark_expansions = "author_id,attachments.media_keys,attachments.poll_ids,referenced_tweets.id,referenced_tweets.id.author_id,referenced_tweets.id.attachments.media_keys";
 const bookmark_user_fields = "id,name,username,description,created_at,verified,verified_type,profile_image_url,profile_banner_url,public_metrics,url,location,protected";
 const bookmark_media_fields = "media_key,type,url,preview_image_url,width,height,alt_text,duration_ms,public_metrics,variants";
 const bookmark_poll_fields = "id,options,duration_minutes,end_datetime,voting_status";
+const thread_estimated_cost_micros_per_post: i64 = 1000;
+const default_thread_max_results: u32 = 100;
+const default_thread_max_posts: u32 = 25;
+const default_thread_window_hours: u32 = 6;
+
+const ThreadSearchMode = enum {
+    auto,
+    timeline,
+    recent,
+    all,
+
+    fn endpointPath(self: ThreadSearchMode) []const u8 {
+        return switch (self) {
+            .auto, .timeline => "/users/:id/tweets",
+            .recent => "/tweets/search/recent",
+            .all => "/tweets/search/all",
+        };
+    }
+
+    fn methodLabel(self: ThreadSearchMode) []const u8 {
+        return switch (self) {
+            .auto, .timeline => "user_timeline",
+            .recent => "search_recent",
+            .all => "search_all",
+        };
+    }
+
+    fn endpointLabel(self: ThreadSearchMode) []const u8 {
+        return switch (self) {
+            .auto, .timeline => "users/:id/tweets",
+            .recent => "search/recent",
+            .all => "search/all",
+        };
+    }
+};
+
+const ThreadExpansionOptions = struct {
+    tweet_id: ?[]const u8 = null,
+    changed: bool = false,
+    dry_run: bool = false,
+    yes: bool = false,
+    retry_partial: bool = false,
+    mode: ThreadSearchMode = .auto,
+    max_results: u32 = default_thread_max_results,
+    max_posts: u32 = default_thread_max_posts,
+    limit: ?u32 = null,
+};
+
+const ThreadExpansionPlan = struct {
+    root_tweet_id: []const u8,
+    root_author_id: []const u8,
+    root_author_username: []const u8,
+    conversation_id: []const u8,
+    query: []const u8,
+    start_time: []const u8,
+    end_time: []const u8,
+    endpoint: ThreadSearchMode,
+    max_results: u32,
+    max_posts: u32,
+    estimated_cost_micros: i64,
+
+    fn deinit(self: ThreadExpansionPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.root_tweet_id);
+        allocator.free(self.root_author_id);
+        allocator.free(self.root_author_username);
+        allocator.free(self.conversation_id);
+        allocator.free(self.query);
+        allocator.free(self.start_time);
+        allocator.free(self.end_time);
+    }
+};
+
+const ThreadMembershipPost = struct {
+    tweet_id: []const u8,
+    raw_json: []const u8,
+    created_at: []const u8,
+
+    fn deinit(self: ThreadMembershipPost, allocator: std.mem.Allocator) void {
+        allocator.free(self.tweet_id);
+        allocator.free(self.raw_json);
+        allocator.free(self.created_at);
+    }
+};
+
+const ThreadBuildResult = struct {
+    status: []const u8,
+    confidence: []const u8,
+    post_count: u32,
+    inferred_posts: u32,
+};
 const config_template =
     \\{
     \\  "x": {
@@ -276,6 +366,8 @@ fn run() !void {
         try commandObsidian(&rt);
     } else if (std.mem.eql(u8, cmd, "kb")) {
         try commandKb(&rt);
+    } else if (std.mem.eql(u8, cmd, "threads")) {
+        try commandThreads(&rt);
     } else if (std.mem.eql(u8, cmd, "integration")) {
         try commandIntegration(&rt);
     } else if (std.mem.eql(u8, cmd, "bookmarks")) {
@@ -330,7 +422,7 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] db init|status
         \\  x-bookmarks [--config PATH] [--home PATH] auth login [--manual|--no-open|--code CODE|--callback-url URL]
         \\  x-bookmarks [--config PATH] [--home PATH] auth status|refresh
-        \\  x-bookmarks [--config PATH] [--home PATH] sync [--full] [--yolo|--yes] [--wait-rate-limit] [--limit-pages N] [--max-results N] [--no-media|--download-media]
+        \\  x-bookmarks [--config PATH] [--home PATH] sync [--full] [--yolo|--yes] [--wait-rate-limit] [--limit-pages N] [--max-results N] [--no-media|--download-media] [--expand-threads] [--thread-search-all]
         \\  x-bookmarks [--config PATH] [--home PATH] export --format jsonl
         \\  x-bookmarks [--config PATH] [--home PATH] viewer export|serve
         \\  x-bookmarks [--config PATH] [--home PATH] assets verify
@@ -342,6 +434,10 @@ fn printHelp() !void {
         \\  x-bookmarks [--config PATH] [--home PATH] kb init
         \\  x-bookmarks [--config PATH] [--home PATH] kb export-raw-x [--changed]
         \\  x-bookmarks [--config PATH] [--home PATH] kb status
+        \\  x-bookmarks [--config PATH] [--home PATH] threads detect [--changed]
+        \\  x-bookmarks [--config PATH] [--home PATH] threads expand --tweet-id TWEET_ID [--dry-run] [--user-timeline|--search-recent|--search-all|--auto] [--max-results N] [--max-posts N] [--yes]
+        \\  x-bookmarks [--config PATH] [--home PATH] threads expand --changed [--dry-run] [--limit N] [--user-timeline|--search-recent|--search-all|--auto]
+        \\  x-bookmarks [--config PATH] [--home PATH] threads status
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks list [--limit N]
         \\  x-bookmarks [--config PATH] [--home PATH] bookmarks stats
         \\  x-bookmarks [--config PATH] [--home PATH] integration test --live [--limit-pages N] [--max-results N] [--no-media]
@@ -785,6 +881,8 @@ fn commandSync(rt: *Runtime) !void {
     var full = false;
     var yolo = false;
     var wait_rate_limit = false;
+    var expand_threads = false;
+    var thread_search_all = false;
     var limit_pages: ?u32 = null;
     var max_results_override: ?u32 = null;
     var download_media_override: ?bool = null;
@@ -797,6 +895,11 @@ fn commandSync(rt: *Runtime) !void {
             yolo = true;
         } else if (std.mem.eql(u8, arg, "--wait-rate-limit")) {
             wait_rate_limit = true;
+        } else if (std.mem.eql(u8, arg, "--expand-threads")) {
+            expand_threads = true;
+        } else if (std.mem.eql(u8, arg, "--thread-search-all")) {
+            expand_threads = true;
+            thread_search_all = true;
         } else if (std.mem.eql(u8, arg, "--limit-pages")) {
             i += 1;
             if (i >= rt.args.len) return AppError.InvalidArguments;
@@ -889,6 +992,19 @@ fn commandSync(rt: *Runtime) !void {
         try std.fs.File.stderr().deprecatedWriter().writeAll("warning: API returned at least 800 bookmarks and no next page; results may be capped by X API access behavior\n");
     }
     try std.fs.File.stdout().deprecatedWriter().print("sync succeeded: pages={} tweets={} new_bookmarks={} early_stop={}\n", .{ result.pages, result.tweets, result.new_bookmarks, result.early_stop_used });
+    if (expand_threads) {
+        const opts = ThreadExpansionOptions{
+            .changed = true,
+            .dry_run = !yolo,
+            .yes = yolo,
+            .mode = if (thread_search_all) .all else .auto,
+            .max_results = default_thread_max_results,
+        };
+        if (!yolo) {
+            try std.fs.File.stdout().deprecatedWriter().writeAll("sync thread expansion requires --yes/--yolo to fetch; showing dry run instead\n");
+        }
+        _ = try expandThreads(&db, rt.allocator, cfg, if (yolo) token.access_token else null, opts);
+    }
 }
 
 fn commandExport(rt: *Runtime) !void {
@@ -1065,6 +1181,90 @@ fn commandKb(rt: *Runtime) !void {
         var paths = try resolveObsidianPaths(rt.allocator, cfg, null);
         defer paths.deinit(rt.allocator);
         try kbStatus(&db, rt.allocator, paths);
+    } else {
+        return AppError.InvalidCommand;
+    }
+}
+
+fn commandThreads(rt: *Runtime) !void {
+    const sub = try requiredSubcommand(rt, "threads");
+    const cfg = try loadRuntimeConfig(rt);
+    var db = try Db.open(cfg.database_path, rt.allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    if (std.mem.eql(u8, sub, "detect")) {
+        var changed_only = false;
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            if (std.mem.eql(u8, rt.args[i], "--changed")) {
+                changed_only = true;
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        const count = try detectThreadCandidates(&db, rt.allocator, changed_only);
+        try std.fs.File.stdout().deprecatedWriter().print("thread candidates detected: {}\n", .{count});
+    } else if (std.mem.eql(u8, sub, "status")) {
+        if (rt.command_index + 2 != rt.args.len) return AppError.InvalidArguments;
+        try printThreadStatus(&db);
+    } else if (std.mem.eql(u8, sub, "expand")) {
+        var opts = ThreadExpansionOptions{};
+        var i = rt.command_index + 2;
+        while (i < rt.args.len) : (i += 1) {
+            const arg = rt.args[i];
+            if (std.mem.eql(u8, arg, "--tweet-id")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.tweet_id = rt.args[i];
+            } else if (std.mem.eql(u8, arg, "--changed")) {
+                opts.changed = true;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
+                opts.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "--yolo")) {
+                opts.yes = true;
+            } else if (std.mem.eql(u8, arg, "--retry-partial")) {
+                opts.retry_partial = true;
+            } else if (std.mem.eql(u8, arg, "--user-timeline")) {
+                opts.mode = .timeline;
+            } else if (std.mem.eql(u8, arg, "--search-recent")) {
+                opts.mode = .recent;
+            } else if (std.mem.eql(u8, arg, "--search-all")) {
+                opts.mode = .all;
+            } else if (std.mem.eql(u8, arg, "--auto")) {
+                opts.mode = .auto;
+            } else if (std.mem.eql(u8, arg, "--max-results")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.max_results = try parseU32Arg(rt.args[i]);
+            } else if (std.mem.eql(u8, arg, "--max-posts")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.max_posts = try parseU32Arg(rt.args[i]);
+            } else if (std.mem.eql(u8, arg, "--limit")) {
+                i += 1;
+                if (i >= rt.args.len) return AppError.InvalidArguments;
+                opts.limit = try parseU32Arg(rt.args[i]);
+            } else {
+                return AppError.InvalidArguments;
+            }
+        }
+        if ((opts.tweet_id == null) == !opts.changed) return AppError.InvalidArguments;
+        if (opts.max_results == 0 or opts.max_results > 100) return AppError.InvalidArguments;
+        if (opts.max_posts == 0 or opts.max_posts > 100) return AppError.InvalidArguments;
+        var token: ?TokenState = null;
+        defer if (token) |t| t.deinit(rt.allocator);
+        if (!opts.dry_run) {
+            if (!opts.yes) {
+                try std.fs.File.stderr().deprecatedWriter().writeAll("thread expansion fetches X API results; rerun with --dry-run or --yes\n");
+                return AppError.InvalidArguments;
+            }
+            if (!fileExists(cfg.token_path)) return AppError.AuthRequired;
+            token = try loadToken(rt.allocator, cfg.token_path);
+            try refreshTokenIfNeeded(rt.allocator, cfg, &token.?);
+        }
+        const expanded = try expandThreads(&db, rt.allocator, cfg, if (token) |t| t.access_token else null, opts);
+        try std.fs.File.stdout().deprecatedWriter().print("thread expansion processed: {}\n", .{expanded});
     } else {
         return AppError.InvalidCommand;
     }
@@ -1772,8 +1972,43 @@ fn applyMigrations(db: *Db) !void {
         \\  last_seen_at TEXT NOT NULL,
         \\  PRIMARY KEY (tweet_id, referenced_tweet_id, reference_type)
         \\);
+        \\CREATE TABLE IF NOT EXISTS thread_expansions (
+        \\  root_tweet_id TEXT PRIMARY KEY,
+        \\  root_author_id TEXT NOT NULL,
+        \\  root_author_username TEXT,
+        \\  conversation_id TEXT NOT NULL,
+        \\  status TEXT NOT NULL,
+        \\  method TEXT,
+        \\  confidence TEXT,
+        \\  post_count INTEGER NOT NULL DEFAULT 0,
+        \\  fetched_at TEXT,
+        \\  api_endpoint TEXT,
+        \\  query TEXT,
+        \\  max_results INTEGER,
+        \\  result_count INTEGER,
+        \\  estimated_cost_micros INTEGER,
+        \\  error_json TEXT,
+        \\  first_seen_at TEXT NOT NULL,
+        \\  last_seen_at TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS thread_posts (
+        \\  root_tweet_id TEXT NOT NULL,
+        \\  tweet_id TEXT NOT NULL,
+        \\  position INTEGER NOT NULL,
+        \\  include_reason TEXT NOT NULL,
+        \\  confidence TEXT NOT NULL,
+        \\  PRIMARY KEY (root_tweet_id, tweet_id)
+        \\);
+        \\CREATE TABLE IF NOT EXISTS thread_candidates (
+        \\  tweet_id TEXT PRIMARY KEY,
+        \\  detected_at TEXT NOT NULL,
+        \\  reason_json TEXT NOT NULL,
+        \\  status TEXT NOT NULL
+        \\);
         \\CREATE INDEX IF NOT EXISTS idx_bookmark_items_last_seen ON bookmark_items(account_user_id, last_seen_run_id);
         \\CREATE INDEX IF NOT EXISTS idx_media_assets_status ON media_assets(status);
+        \\CREATE INDEX IF NOT EXISTS idx_thread_expansions_status ON thread_expansions(status);
+        \\CREATE INDEX IF NOT EXISTS idx_thread_posts_root_position ON thread_posts(root_tweet_id, position);
         \\INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES ('001_initial', datetime('now'));
     );
     try ensureMediaAssetPolicyColumns(db);
@@ -2408,6 +2643,7 @@ fn ingestBookmarkPage(
                 }
             }
             const was_new = try upsertBookmarkItem(db, allocator, account_user_id, tweet_id, run_id, position, complete);
+            _ = try detectAndRecordThreadCandidate(db, allocator, tweet, false);
             if (was_new) result.new_bookmarks += 1;
             result.tweets += 1;
         }
@@ -2721,6 +2957,704 @@ fn upsertBookmarkItem(db: *Db, allocator: std.mem.Allocator, account_user_id: []
     _ = c.sqlite3_bind_int64(stmt, 8, import_position);
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
     return !was_existing;
+}
+
+fn detectThreadCandidates(db: *Db, allocator: std.mem.Allocator, changed_only: bool) !u32 {
+    const stmt = try db.prepare(
+        \\SELECT t.raw_json
+        \\FROM bookmark_items b
+        \\JOIN tweets t ON t.tweet_id = b.tweet_id
+        \\WHERE b.active = 1
+        \\ORDER BY b.import_position IS NULL, b.import_position, b.tweet_id DESC
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    var count: u32 = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(stmt, 0), .{}) catch continue;
+        defer parsed.deinit();
+        if (try detectAndRecordThreadCandidate(db, allocator, parsed.value, changed_only)) count += 1;
+    }
+    return count;
+}
+
+fn detectAndRecordThreadCandidate(db: *Db, allocator: std.mem.Allocator, tweet: std.json.Value, changed_only: bool) !bool {
+    const tweet_id = getString(tweet, "id") orelse return false;
+    const reasons = try threadDetectionReasonsJson(allocator, tweet);
+    defer if (reasons) |r| allocator.free(r);
+    if (reasons == null) return false;
+    if (changed_only and try threadCandidateExists(db, tweet_id)) return false;
+    try upsertThreadCandidate(db, allocator, tweet_id, reasons.?);
+    try upsertMissingThreadExpansionForTweet(db, allocator, tweet, "missing");
+    return true;
+}
+
+fn threadDetectionReasonsJson(allocator: std.mem.Allocator, tweet: std.json.Value) !?[]const u8 {
+    const text = rawXPostText(tweet, getString(tweet, "text") orelse "");
+    var reasons = std.ArrayList([]const u8).empty;
+    defer reasons.deinit(allocator);
+    if (containsThreadOneOfN(text)) try reasons.append(allocator, "text contains 1/N");
+    if (containsStandaloneOneSlash(text)) try reasons.append(allocator, "text contains standalone 1/");
+    if (containsThreadMarker(text)) try reasons.append(allocator, "text contains thread marker");
+    if (containsThreadPhrase(text)) try reasons.append(allocator, "text contains thread phrase");
+    const tweet_id = getString(tweet, "id") orelse "";
+    const conversation_id = getString(tweet, "conversation_id") orelse "";
+    const replies = tweetReplyCount(tweet);
+    if (tweet_id.len > 0 and std.mem.eql(u8, tweet_id, conversation_id) and replies > 0 and (containsThreadMarker(text) or containsThreadOneOfN(text) or containsStandaloneOneSlash(text))) {
+        try reasons.append(allocator, "root post has replies and thread signal");
+    }
+    if (reasons.items.len == 0) return null;
+    var out = std.ArrayList(u8).empty;
+    const w = out.writer(allocator);
+    try w.writeAll("[");
+    for (reasons.items, 0..) |reason, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("{f}", .{std.json.fmt(reason, .{})});
+    }
+    try w.writeAll("]");
+    const slice = try out.toOwnedSlice(allocator);
+    return slice;
+}
+
+fn containsThreadOneOfN(text: []const u8) bool {
+    var i: usize = 0;
+    while (i + 3 <= text.len) : (i += 1) {
+        if (text[i] != '1' or text[i + 1] != '/') continue;
+        const n = text[i + 2];
+        if (n == 'N' or n == 'n' or (n >= '2' and n <= '9')) return true;
+    }
+    return false;
+}
+
+fn containsStandaloneOneSlash(text: []const u8) bool {
+    var i: usize = 0;
+    while (i + 2 <= text.len) : (i += 1) {
+        if (text[i] != '1' or text[i + 1] != '/') continue;
+        if (i > 0 and std.ascii.isAlphanumeric(text[i - 1])) continue;
+        return true;
+    }
+    return false;
+}
+
+fn containsThreadMarker(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "\xF0\x9F\xA7\xB5") != null;
+}
+
+fn containsThreadPhrase(text: []const u8) bool {
+    return containsIgnoreCase(text, "thread below") or
+        containsIgnoreCase(text, "in the thread below") or
+        containsIgnoreCase(text, "some thoughts") or
+        containsIgnoreCase(text, "here are my thoughts") or
+        containsIgnoreCase(text, "a thread") or
+        containsIgnoreCase(text, "1 of");
+}
+
+fn hasThreadNumberingSignal(tweet: std.json.Value) bool {
+    const text = rawXPostText(tweet, getString(tweet, "text") orelse "");
+    return containsThreadOneOfN(text) or containsStandaloneOneSlash(text) or containsThreadMarker(text) or containsNumericPrefix(text);
+}
+
+fn containsNumericPrefix(text: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    if (trimmed.len < 2) return false;
+    var i: usize = 0;
+    while (i < trimmed.len and trimmed[i] >= '0' and trimmed[i] <= '9') : (i += 1) {}
+    if (i == 0 or i > 3 or i >= trimmed.len) return false;
+    return trimmed[i] == '.' or trimmed[i] == '/';
+}
+
+fn tweetReplyCount(tweet: std.json.Value) i64 {
+    const metrics = getObject(tweet, "public_metrics") orelse return 0;
+    return getInt(metrics, "reply_count") orelse 0;
+}
+
+fn threadCandidateExists(db: *Db, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM thread_candidates WHERE tweet_id=? LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn upsertThreadCandidate(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8, reason_json: []const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO thread_candidates(tweet_id, detected_at, reason_json, status)
+        \\VALUES (?, ?, ?, 'missing')
+        \\ON CONFLICT(tweet_id) DO UPDATE SET reason_json=excluded.reason_json, status=CASE WHEN status='ignored' THEN status ELSE excluded.status END
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    try bindText(stmt, 2, now);
+    try bindText(stmt, 3, reason_json);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn upsertMissingThreadExpansionForTweet(db: *Db, allocator: std.mem.Allocator, tweet: std.json.Value, status: []const u8) !void {
+    const tweet_id = getString(tweet, "id") orelse return;
+    const author_id = getString(tweet, "author_id") orelse "";
+    const conversation_id = getString(tweet, "conversation_id") orelse tweet_id;
+    const username = if (author_id.len > 0) try usernameForUser(db, allocator, author_id) else null;
+    defer if (username) |u| allocator.free(u);
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO thread_expansions(root_tweet_id, root_author_id, root_author_username, conversation_id, status, post_count, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+        \\ON CONFLICT(root_tweet_id) DO UPDATE SET root_author_id=excluded.root_author_id, root_author_username=excluded.root_author_username, conversation_id=excluded.conversation_id, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    try bindText(stmt, 2, author_id);
+    if (username) |u| try bindText(stmt, 3, u) else _ = c.sqlite3_bind_null(stmt, 3);
+    try bindText(stmt, 4, conversation_id);
+    try bindText(stmt, 5, status);
+    try bindText(stmt, 6, now);
+    try bindText(stmt, 7, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn printThreadStatus(db: *Db) !void {
+    const out = std.fs.File.stdout().deprecatedWriter();
+    try out.print("thread candidates: {}\n", .{try scalarCount(db, "SELECT count(*) FROM thread_candidates")});
+    try out.print("thread expansions: {}\n", .{try scalarCount(db, "SELECT count(*) FROM thread_expansions")});
+    const stmt = try db.prepare(
+        \\SELECT status, count(*)
+        \\FROM thread_expansions
+        \\GROUP BY status
+        \\ORDER BY status
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try out.print("{s}: {}\n", .{ colText(stmt, 0), c.sqlite3_column_int64(stmt, 1) });
+    }
+}
+
+fn expandThreads(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_token: ?[]const u8, opts: ThreadExpansionOptions) !u32 {
+    if (opts.changed) _ = try detectThreadCandidates(db, allocator, true);
+    var targets = std.ArrayList([]const u8).empty;
+    defer {
+        for (targets.items) |id| allocator.free(id);
+        targets.deinit(allocator);
+    }
+    if (opts.tweet_id) |id| {
+        try targets.append(allocator, try allocator.dupe(u8, id));
+    } else {
+        try collectChangedThreadTargets(db, allocator, opts.limit, &targets);
+    }
+
+    var processed: u32 = 0;
+    for (targets.items) |root_id| {
+        if (!opts.retry_partial and try threadExpansionComplete(db, root_id)) {
+            if (!builtin.is_test) try std.fs.File.stdout().deprecatedWriter().print("thread expansion cached: {s}\n", .{root_id});
+            continue;
+        }
+        const plan = try buildThreadExpansionPlan(db, allocator, root_id, opts.mode, opts.max_results, opts.max_posts);
+        defer plan.deinit(allocator);
+        if (!builtin.is_test) try printThreadExpansionPlan(plan, opts.dry_run);
+        if (opts.dry_run) {
+            processed += 1;
+            continue;
+        }
+        const token = access_token orelse return AppError.AuthRequired;
+        try runThreadExpansionFetch(db, allocator, cfg, token, plan);
+        processed += 1;
+    }
+    return processed;
+}
+
+fn collectChangedThreadTargets(db: *Db, allocator: std.mem.Allocator, limit: ?u32, targets: *std.ArrayList([]const u8)) !void {
+    const limit_clause = if (limit != null) " LIMIT ?" else "";
+    const sql = try std.fmt.allocPrint(allocator,
+        \\SELECT te.root_tweet_id
+        \\FROM thread_expansions te
+        \\JOIN bookmark_items b ON b.tweet_id = te.root_tweet_id AND b.active = 1
+        \\WHERE te.status IN ('missing', 'failed', 'unavailable')
+        \\ORDER BY te.last_seen_at DESC, te.root_tweet_id DESC{s}
+    , .{limit_clause});
+    defer allocator.free(sql);
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    if (limit) |n| _ = c.sqlite3_bind_int(stmt, 1, @intCast(n));
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try targets.append(allocator, try allocator.dupe(u8, colText(stmt, 0)));
+    }
+}
+
+fn threadExpansionComplete(db: *Db, root_tweet_id: []const u8) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM thread_expansions WHERE root_tweet_id=? AND status='complete' LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, root_tweet_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn buildThreadExpansionPlan(db: *Db, allocator: std.mem.Allocator, root_tweet_id: []const u8, mode: ThreadSearchMode, max_results: u32, max_posts: u32) !ThreadExpansionPlan {
+    const stmt = try db.prepare(
+        \\SELECT t.tweet_id, coalesce(t.author_id, ''), coalesce(u.username, ''), coalesce(t.conversation_id, t.tweet_id), coalesce(t.created_at, '')
+        \\FROM tweets t
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE t.tweet_id = ?
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, root_tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return AppError.InvalidArguments;
+    const username = colText(stmt, 2);
+    if (username.len == 0) return AppError.InvalidArguments;
+    const query = try std.fmt.allocPrint(allocator, "conversation_id:{s} from:{s}", .{ root_tweet_id, username });
+    errdefer allocator.free(query);
+    const start_time = try threadApiStartTime(allocator, colText(stmt, 4));
+    errdefer allocator.free(start_time);
+    const end_time = try threadApiEndTime(allocator, start_time, default_thread_window_hours);
+    errdefer allocator.free(end_time);
+    return .{
+        .root_tweet_id = try allocator.dupe(u8, colText(stmt, 0)),
+        .root_author_id = try allocator.dupe(u8, colText(stmt, 1)),
+        .root_author_username = try allocator.dupe(u8, username),
+        .conversation_id = try allocator.dupe(u8, colText(stmt, 3)),
+        .query = query,
+        .start_time = start_time,
+        .end_time = end_time,
+        .endpoint = mode,
+        .max_results = max_results,
+        .max_posts = max_posts,
+        .estimated_cost_micros = threadEstimatedCostMicros(mode, max_results),
+    };
+}
+
+fn threadEstimatedCostMicros(mode: ThreadSearchMode, max_results: u32) i64 {
+    return switch (mode) {
+        .auto, .timeline => 0,
+        .recent, .all => @as(i64, max_results) * thread_estimated_cost_micros_per_post,
+    };
+}
+
+fn printThreadExpansionPlan(plan: ThreadExpansionPlan, dry_run: bool) !void {
+    try std.fs.File.stdout().deprecatedWriter().print(
+        \\thread expansion {s}:
+        \\  tweet_id: {s}
+        \\  query: {s}
+        \\  endpoint: {s}
+        \\  max_results: {}
+        \\  max_posts: {}
+        \\  start_time: {s}
+        \\  end_time: {s}
+        \\  estimated_cost: ${d:.3}
+        \\  expected_rate_limit_impact: 1 API request
+        \\
+    , .{
+        if (dry_run) "dry run" else "run",
+        plan.root_tweet_id,
+        plan.query,
+        plan.endpoint.endpointLabel(),
+        plan.max_results,
+        plan.max_posts,
+        plan.start_time,
+        plan.end_time,
+        @as(f64, @floatFromInt(plan.estimated_cost_micros)) / 1_000_000.0,
+    });
+}
+
+fn runThreadExpansionFetch(db: *Db, allocator: std.mem.Allocator, cfg: Config, access_token: []const u8, plan: ThreadExpansionPlan) !void {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
+    defer allocator.free(auth);
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+    const url = try buildThreadSearchUrl(allocator, plan);
+    defer allocator.free(url);
+    const response = try httpFetch(allocator, .GET, url, null, &headers);
+    defer freeHttpResponse(allocator, response);
+    if (response.status == .unauthorized) return AppError.AuthRequired;
+    if (response.status == .too_many_requests) return AppError.RateLimited;
+    if (response.status == .forbidden or response.status == .not_found) {
+        const err = try std.fmt.allocPrint(allocator, "{{\"http_status\":{}}}", .{@intFromEnum(response.status)});
+        defer allocator.free(err);
+        try upsertThreadExpansionStatus(db, allocator, plan, "unavailable", null, 0, 0, err);
+        return;
+    }
+    if (response.status != .ok) {
+        const err = try std.fmt.allocPrint(allocator, "{{\"http_status\":{}}}", .{@intFromEnum(response.status)});
+        defer allocator.free(err);
+        try upsertThreadExpansionStatus(db, allocator, plan, "failed", null, 0, 0, err);
+        return AppError.HttpError;
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    try beginTransaction(db);
+    ingestThreadSearchResponse(db, allocator, parsed.value, plan) catch |err| {
+        try rollbackTransaction(db);
+        return err;
+    };
+    try commitTransaction(db);
+    if (cfg.download_media) try downloadAssetsForThread(db, allocator, cfg.assets_dir, cfg.media_policy, plan.root_tweet_id);
+}
+
+fn buildThreadSearchUrl(allocator: std.mem.Allocator, plan: ThreadExpansionPlan) ![]const u8 {
+    if (plan.endpoint == .auto or plan.endpoint == .timeline) return buildThreadTimelineUrl(allocator, plan);
+    const q = try urlEncode(allocator, plan.query);
+    defer allocator.free(q);
+    return std.fmt.allocPrint(
+        allocator,
+        x_api_base ++ "{s}?query={s}&max_results={}&tweet.fields={s}&expansions={s}&user.fields={s}&media.fields={s}&poll.fields={s}",
+        .{ plan.endpoint.endpointPath(), q, plan.max_results, bookmark_tweet_fields, bookmark_expansions, bookmark_user_fields, bookmark_media_fields, bookmark_poll_fields },
+    );
+}
+
+fn buildThreadTimelineUrl(allocator: std.mem.Allocator, plan: ThreadExpansionPlan) ![]const u8 {
+    const start = try urlEncode(allocator, plan.start_time);
+    defer allocator.free(start);
+    const end = try urlEncode(allocator, plan.end_time);
+    defer allocator.free(end);
+    return std.fmt.allocPrint(
+        allocator,
+        x_api_base ++ "/users/{s}/tweets?start_time={s}&end_time={s}&max_results={}&tweet.fields={s}&expansions={s}&user.fields={s}&media.fields={s}&poll.fields={s}",
+        .{ plan.root_author_id, start, end, plan.max_results, bookmark_tweet_fields, bookmark_expansions, bookmark_user_fields, bookmark_media_fields, bookmark_poll_fields },
+    );
+}
+
+fn ingestThreadSearchResponse(db: *Db, allocator: std.mem.Allocator, root: std.json.Value, plan: ThreadExpansionPlan) !void {
+    const root_created_at = try tweetCreatedAt(db, allocator, plan.root_tweet_id);
+    defer allocator.free(root_created_at);
+    var eligible_media_keys = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = eligible_media_keys.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        eligible_media_keys.deinit();
+    }
+    try collectEligibleThreadMediaKeys(allocator, root, plan, root_created_at, &eligible_media_keys);
+    try ingestThreadIncludes(db, allocator, root, plan, root_created_at, &eligible_media_keys);
+    var result_count: i64 = 0;
+    if (getArray(root, "data")) |tweets| {
+        result_count = @intCast(tweets.items.len);
+        for (tweets.items) |tweet| {
+            if (tweet != .object) continue;
+            if (!threadSearchTweetEligible(tweet, plan, root_created_at)) continue;
+            try upsertTweetFromValue(db, allocator, tweet);
+        }
+    }
+    const build = try buildAndPersistThreadMembership(db, allocator, plan);
+    try upsertThreadExpansionStatus(db, allocator, plan, build.status, build.confidence, build.post_count, result_count, null);
+}
+
+fn collectEligibleThreadMediaKeys(allocator: std.mem.Allocator, root: std.json.Value, plan: ThreadExpansionPlan, root_created_at: []const u8, keys: *std.StringHashMap(void)) !void {
+    if (getArray(root, "data")) |tweets| {
+        for (tweets.items) |tweet| {
+            if (tweet != .object) continue;
+            if (!threadSearchTweetEligible(tweet, plan, root_created_at)) continue;
+            try collectMediaKeysFromTweet(allocator, tweet, keys);
+        }
+    }
+    const includes = getObject(root, "includes") orelse return;
+    if (getArray(includes, "tweets")) |tweets_arr| {
+        for (tweets_arr.items) |tweet| {
+            if (tweet != .object) continue;
+            if (!threadSearchTweetEligible(tweet, plan, root_created_at)) continue;
+            try collectMediaKeysFromTweet(allocator, tweet, keys);
+        }
+    }
+}
+
+fn collectMediaKeysFromTweet(allocator: std.mem.Allocator, tweet: std.json.Value, keys: *std.StringHashMap(void)) !void {
+    const attachments = getObject(tweet, "attachments") orelse return;
+    const arr = getArray(attachments, "media_keys") orelse return;
+    for (arr.items) |item| {
+        if (item != .string) continue;
+        if (keys.contains(item.string)) continue;
+        try keys.put(try allocator.dupe(u8, item.string), {});
+    }
+}
+
+fn ingestThreadIncludes(db: *Db, allocator: std.mem.Allocator, root: std.json.Value, plan: ThreadExpansionPlan, root_created_at: []const u8, eligible_media_keys: *std.StringHashMap(void)) !void {
+    const includes = getObject(root, "includes") orelse return;
+    if (getArray(includes, "users")) |users_arr| {
+        for (users_arr.items) |user| {
+            if (user != .object) continue;
+            if (!std.mem.eql(u8, getString(user, "id") orelse "", plan.root_author_id)) continue;
+            try upsertUserFromValue(db, allocator, user);
+        }
+    }
+    if (getArray(includes, "media")) |media_arr| {
+        for (media_arr.items) |media| {
+            if (media != .object) continue;
+            const media_key = getString(media, "media_key") orelse continue;
+            if (!eligible_media_keys.contains(media_key)) continue;
+            try upsertMediaFromValue(db, allocator, media);
+        }
+    }
+    if (getArray(includes, "tweets")) |tweets_arr| {
+        for (tweets_arr.items) |tweet| {
+            if (tweet != .object) continue;
+            if (!threadSearchTweetEligible(tweet, plan, root_created_at)) continue;
+            try upsertTweetFromValue(db, allocator, tweet);
+        }
+    }
+}
+
+fn threadSearchTweetEligible(tweet: std.json.Value, plan: ThreadExpansionPlan, root_created_at: []const u8) bool {
+    const tweet_id = getString(tweet, "id") orelse return false;
+    if (std.mem.eql(u8, tweet_id, plan.root_tweet_id)) return true;
+    if (!std.mem.eql(u8, getString(tweet, "conversation_id") orelse "", plan.root_tweet_id)) return false;
+    if (!std.mem.eql(u8, getString(tweet, "author_id") orelse "", plan.root_author_id)) return false;
+    if (getString(tweet, "in_reply_to_user_id")) |reply_to_user| {
+        if (!std.mem.eql(u8, reply_to_user, plan.root_author_id)) return false;
+    }
+    const created_at = getString(tweet, "created_at") orelse return false;
+    if (root_created_at.len > 0 and std.mem.lessThan(u8, created_at, root_created_at)) return false;
+    return true;
+}
+
+fn tweetCreatedAt(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) ![]const u8 {
+    const stmt = try db.prepare("SELECT coalesce(created_at, '') FROM tweets WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return allocator.dupe(u8, "");
+    return allocator.dupe(u8, colText(stmt, 0));
+}
+
+fn threadApiStartTime(allocator: std.mem.Allocator, created_at: []const u8) ![]const u8 {
+    if (created_at.len == 0) return allocator.dupe(u8, "");
+    const seconds = parseIsoUtcTimestampSeconds(created_at) catch return allocator.dupe(u8, created_at);
+    return formatIsoUtcTimestampSeconds(allocator, seconds);
+}
+
+fn threadApiEndTime(allocator: std.mem.Allocator, start_time: []const u8, window_hours: u32) ![]const u8 {
+    if (start_time.len == 0) return allocator.dupe(u8, "");
+    const seconds = parseIsoUtcTimestampSeconds(start_time) catch return allocator.dupe(u8, start_time);
+    return formatIsoUtcTimestampSeconds(allocator, seconds + @as(i64, window_hours) * 3600);
+}
+
+fn parseIsoUtcTimestampSeconds(value: []const u8) !i64 {
+    if (value.len < 20) return AppError.InvalidArguments;
+    if (value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':') return AppError.InvalidArguments;
+    const year = try std.fmt.parseInt(i64, value[0..4], 10);
+    const month = try std.fmt.parseInt(u8, value[5..7], 10);
+    const day = try std.fmt.parseInt(u8, value[8..10], 10);
+    const hour = try std.fmt.parseInt(u8, value[11..13], 10);
+    const minute = try std.fmt.parseInt(u8, value[14..16], 10);
+    const second = try std.fmt.parseInt(u8, value[17..19], 10);
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return AppError.InvalidArguments;
+    const days = daysFromCivil(year, month, day);
+    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
+fn formatIsoUtcTimestampSeconds(allocator: std.mem.Allocator, timestamp: i64) ![]const u8 {
+    const days = @divFloor(timestamp, 86400);
+    const day_seconds = @mod(timestamp, 86400);
+    const civil = civilFromDays(days);
+    const hour = @divFloor(day_seconds, 3600);
+    const minute = @divFloor(@mod(day_seconds, 3600), 60);
+    const second = @mod(day_seconds, 60);
+    var out = std.ArrayList(u8).empty;
+    try appendPaddedDecimal(allocator, &out, civil.year, 4);
+    try out.append(allocator, '-');
+    try appendPaddedDecimal(allocator, &out, civil.month, 2);
+    try out.append(allocator, '-');
+    try appendPaddedDecimal(allocator, &out, civil.day, 2);
+    try out.append(allocator, 'T');
+    try appendPaddedDecimal(allocator, &out, hour, 2);
+    try out.append(allocator, ':');
+    try appendPaddedDecimal(allocator, &out, minute, 2);
+    try out.append(allocator, ':');
+    try appendPaddedDecimal(allocator, &out, second, 2);
+    try out.append(allocator, 'Z');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendPaddedDecimal(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: i64, width: usize) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{}", .{value});
+    if (text.len < width) {
+        for (0..(width - text.len)) |_| try out.append(allocator, '0');
+    }
+    try out.appendSlice(allocator, text);
+}
+
+fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
+    var y = year;
+    const m: i64 = @intCast(month);
+    y -= if (m <= 2) 1 else 0;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = m + if (m > 2) @as(i64, -3) else @as(i64, 9);
+    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, @intCast(day)) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+const CivilDate = struct {
+    year: i64,
+    month: i64,
+    day: i64,
+};
+
+fn civilFromDays(days: i64) CivilDate {
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
+    y += if (m <= 2) 1 else 0;
+    return .{ .year = y, .month = m, .day = d };
+}
+
+fn upsertThreadExpansionStatus(db: *Db, allocator: std.mem.Allocator, plan: ThreadExpansionPlan, status: []const u8, confidence: ?[]const u8, post_count: u32, result_count: i64, error_json: ?[]const u8) !void {
+    const now = try timestampString(allocator);
+    defer allocator.free(now);
+    const stmt = try db.prepare(
+        \\INSERT INTO thread_expansions(root_tweet_id, root_author_id, root_author_username, conversation_id, status, method, confidence, post_count, fetched_at, api_endpoint, query, max_results, result_count, estimated_cost_micros, error_json, first_seen_at, last_seen_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(root_tweet_id) DO UPDATE SET root_author_id=excluded.root_author_id, root_author_username=excluded.root_author_username, conversation_id=excluded.conversation_id, status=excluded.status, method=excluded.method, confidence=excluded.confidence, post_count=excluded.post_count, fetched_at=excluded.fetched_at, api_endpoint=excluded.api_endpoint, query=excluded.query, max_results=excluded.max_results, result_count=excluded.result_count, estimated_cost_micros=excluded.estimated_cost_micros, error_json=excluded.error_json, last_seen_at=excluded.last_seen_at
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, plan.root_tweet_id);
+    try bindText(stmt, 2, plan.root_author_id);
+    try bindText(stmt, 3, plan.root_author_username);
+    try bindText(stmt, 4, plan.root_tweet_id);
+    try bindText(stmt, 5, status);
+    try bindText(stmt, 6, plan.endpoint.methodLabel());
+    if (confidence) |v| try bindText(stmt, 7, v) else _ = c.sqlite3_bind_null(stmt, 7);
+    _ = c.sqlite3_bind_int(stmt, 8, @intCast(post_count));
+    try bindText(stmt, 9, now);
+    try bindText(stmt, 10, plan.endpoint.endpointLabel());
+    try bindText(stmt, 11, plan.query);
+    _ = c.sqlite3_bind_int(stmt, 12, @intCast(plan.max_results));
+    _ = c.sqlite3_bind_int64(stmt, 13, result_count);
+    _ = c.sqlite3_bind_int64(stmt, 14, plan.estimated_cost_micros);
+    if (error_json) |e| try bindText(stmt, 15, e) else _ = c.sqlite3_bind_null(stmt, 15);
+    try bindText(stmt, 16, now);
+    try bindText(stmt, 17, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+    if (std.mem.eql(u8, status, "complete") or std.mem.eql(u8, status, "partial")) {
+        try updateThreadCandidateStatus(db, plan.root_tweet_id, status);
+    }
+}
+
+fn updateThreadCandidateStatus(db: *Db, tweet_id: []const u8, status: []const u8) !void {
+    const stmt = try db.prepare("UPDATE thread_candidates SET status=? WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, status);
+    try bindText(stmt, 2, tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn buildAndPersistThreadMembership(db: *Db, allocator: std.mem.Allocator, plan: ThreadExpansionPlan) !ThreadBuildResult {
+    var posts = try loadThreadCandidatePosts(db, allocator, plan);
+    defer {
+        for (posts.items) |post| post.deinit(allocator);
+        posts.deinit(allocator);
+    }
+    try clearThreadPosts(db, plan.root_tweet_id);
+
+    var kept = std.StringHashMap(void).init(allocator);
+    defer kept.deinit();
+    var position: u32 = 0;
+    var inferred: u32 = 0;
+    var truncated = false;
+
+    for (posts.items) |post| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, post.raw_json, .{}) catch continue;
+        defer parsed.deinit();
+        var include = false;
+        var reason: []const u8 = "root";
+        var confidence: []const u8 = "high";
+        if (std.mem.eql(u8, post.tweet_id, plan.root_tweet_id)) {
+            include = true;
+        } else if (replyReferencesKept(parsed.value, &kept)) {
+            include = true;
+            reason = "reply_chain";
+        } else if (hasThreadNumberingSignal(parsed.value)) {
+            include = true;
+            reason = "numbering_inferred";
+            confidence = "medium";
+            inferred += 1;
+        }
+        if (!include) continue;
+        if (position >= plan.max_posts) {
+            truncated = true;
+            continue;
+        }
+        try kept.put(post.tweet_id, {});
+        position += 1;
+        try insertThreadPost(db, plan.root_tweet_id, post.tweet_id, position, reason, confidence);
+    }
+
+    if (position == 0) {
+        try insertThreadPost(db, plan.root_tweet_id, plan.root_tweet_id, 1, "root", "low");
+        return .{ .status = "partial", .confidence = "low", .post_count = 1, .inferred_posts = 0 };
+    }
+    if (position == 1) return .{ .status = "partial", .confidence = "low", .post_count = position, .inferred_posts = inferred };
+    if (truncated) return .{ .status = "partial", .confidence = "medium", .post_count = position, .inferred_posts = inferred };
+    if (inferred > 0) return .{ .status = "partial", .confidence = "medium", .post_count = position, .inferred_posts = inferred };
+    return .{ .status = "complete", .confidence = "high", .post_count = position, .inferred_posts = inferred };
+}
+
+fn loadThreadCandidatePosts(db: *Db, allocator: std.mem.Allocator, plan: ThreadExpansionPlan) !std.ArrayList(ThreadMembershipPost) {
+    var posts = std.ArrayList(ThreadMembershipPost).empty;
+    const stmt = try db.prepare(
+        \\SELECT tweet_id, raw_json, coalesce(created_at, '')
+        \\FROM tweets
+        \\WHERE conversation_id = ?
+        \\  AND author_id = ?
+        \\  AND (created_at IS NULL OR created_at = '' OR created_at >= (SELECT coalesce(created_at, '') FROM tweets WHERE tweet_id = ?))
+        \\ORDER BY coalesce(created_at, ''), tweet_id
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, plan.root_tweet_id);
+    try bindText(stmt, 2, plan.root_author_id);
+    try bindText(stmt, 3, plan.root_tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try posts.append(allocator, .{
+            .tweet_id = try allocator.dupe(u8, colText(stmt, 0)),
+            .raw_json = try allocator.dupe(u8, colText(stmt, 1)),
+            .created_at = try allocator.dupe(u8, colText(stmt, 2)),
+        });
+    }
+    return posts;
+}
+
+fn clearThreadPosts(db: *Db, root_tweet_id: []const u8) !void {
+    const stmt = try db.prepare("DELETE FROM thread_posts WHERE root_tweet_id=?");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, root_tweet_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn insertThreadPost(db: *Db, root_tweet_id: []const u8, tweet_id: []const u8, position: u32, reason: []const u8, confidence: []const u8) !void {
+    const stmt = try db.prepare("INSERT OR REPLACE INTO thread_posts(root_tweet_id, tweet_id, position, include_reason, confidence) VALUES (?, ?, ?, ?, ?)");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, root_tweet_id);
+    try bindText(stmt, 2, tweet_id);
+    _ = c.sqlite3_bind_int(stmt, 3, @intCast(position));
+    try bindText(stmt, 4, reason);
+    try bindText(stmt, 5, confidence);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
+}
+
+fn replyReferencesKept(tweet: std.json.Value, kept: *std.StringHashMap(void)) bool {
+    const refs = getArray(tweet, "referenced_tweets") orelse return false;
+    for (refs.items) |ref| {
+        if (ref != .object) continue;
+        if (!std.mem.eql(u8, getString(ref, "type") orelse "", "replied_to")) continue;
+        const id = getString(ref, "id") orelse continue;
+        if (kept.contains(id)) return true;
+    }
+    return false;
 }
 
 fn bookmarkCompleteForOfflineRender(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8) !bool {
@@ -3225,48 +4159,96 @@ fn downloadAssetsFromIncludes(db: *Db, allocator: std.mem.Allocator, assets_dir:
     if (getArray(includes, "media")) |media_arr| {
         for (media_arr.items) |media| {
             if (media != .object) continue;
-            const key = getString(media, "media_key") orelse "";
-            const width = getInt(media, "width");
-            const height = getInt(media, "height");
-            if (!std.mem.eql(u8, media_policy, "metadata-only")) {
-                if (getString(media, "url")) |url| try downloadAsset(db, allocator, assets_dir, key, "image", url, width, height);
-                if (getString(media, "preview_image_url")) |url| try downloadAsset(db, allocator, assets_dir, key, "preview_image", url, width, height);
-            } else {
-                if (getString(media, "url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
-                if (getString(media, "preview_image_url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "preview_image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
-            }
-            if (getArray(media, "variants")) |variants| {
-                if (selectVideoVariant(variants)) |url| {
-                    const kind = if (std.mem.eql(u8, getString(media, "type") orelse "", "animated_gif")) "animated_gif_variant" else "video_variant";
-                    if (std.mem.eql(u8, media_policy, "all-local")) {
-                        try downloadAsset(db, allocator, assets_dir, key, kind, url, width, height);
-                    } else {
-                        try recordRemoteOnlyMediaAssetOnce(db, allocator, key, kind, url, width, height, "{\"reason\":\"local_video_disabled_by_policy\"}");
-                    }
-                } else if (variants.items.len > 0) {
-                    const source = try std.fmt.allocPrint(allocator, "x-bookmarks:media:{s}:variant", .{key});
-                    defer allocator.free(source);
-                    try recordSkippedMediaAssetOnce(db, allocator, key, "video_variant", source, width, height, "{\"reason\":\"no_mp4_variant\"}");
-                }
-            }
+            try downloadAssetsForMediaValue(db, allocator, assets_dir, media_policy, media);
         }
     }
     if (getArray(includes, "users")) |users_arr| {
         for (users_arr.items) |user| {
             if (user != .object) continue;
-            const user_id = getString(user, "id") orelse "";
-            if (!std.mem.eql(u8, media_policy, "metadata-only") and getString(user, "profile_image_url") != null) {
-                const url = getString(user, "profile_image_url").?;
-                const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
-                defer allocator.free(key);
-                try downloadAsset(db, allocator, assets_dir, key, "author_avatar", url, null, null);
-            } else if (std.mem.eql(u8, media_policy, "metadata-only")) {
-                if (getString(user, "profile_image_url")) |url| {
-                    const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
-                    defer allocator.free(key);
-                    try recordSkippedMediaAssetOnce(db, allocator, key, "author_avatar", url, null, null, "{\"reason\":\"metadata_only_policy\"}");
-                }
+            try downloadAssetsForUserValue(db, allocator, assets_dir, media_policy, user);
+        }
+    }
+}
+
+fn downloadAssetsForThread(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, media_policy: []const u8, root_tweet_id: []const u8) !void {
+    const media_stmt = try db.prepare(
+        \\SELECT DISTINCT m.raw_json
+        \\FROM thread_posts tp
+        \\JOIN tweet_media tm ON tm.tweet_id = tp.tweet_id
+        \\JOIN media m ON m.media_key = tm.media_key
+        \\WHERE tp.root_tweet_id = ?
+        \\ORDER BY m.media_key
+    );
+    defer _ = c.sqlite3_finalize(media_stmt);
+    try bindText(media_stmt, 1, root_tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(media_stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(media_stmt, 0), .{}) catch continue;
+        defer parsed.deinit();
+        try downloadAssetsForMediaValue(db, allocator, assets_dir, media_policy, parsed.value);
+    }
+
+    const user_stmt = try db.prepare(
+        \\SELECT DISTINCT u.raw_json
+        \\FROM thread_posts tp
+        \\JOIN tweets t ON t.tweet_id = tp.tweet_id
+        \\JOIN users u ON u.user_id = t.author_id
+        \\WHERE tp.root_tweet_id = ?
+        \\ORDER BY u.user_id
+    );
+    defer _ = c.sqlite3_finalize(user_stmt);
+    try bindText(user_stmt, 1, root_tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(user_stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(user_stmt, 0), .{}) catch continue;
+        defer parsed.deinit();
+        try downloadAssetsForUserValue(db, allocator, assets_dir, media_policy, parsed.value);
+    }
+}
+
+fn downloadAssetsForMediaValue(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, media_policy: []const u8, media: std.json.Value) !void {
+    const key = getString(media, "media_key") orelse "";
+    const width = getInt(media, "width");
+    const height = getInt(media, "height");
+    if (!std.mem.eql(u8, media_policy, "metadata-only")) {
+        if (getString(media, "url")) |url| try downloadAsset(db, allocator, assets_dir, key, "image", url, width, height);
+        if (getString(media, "preview_image_url")) |url| try downloadAsset(db, allocator, assets_dir, key, "preview_image", url, width, height);
+    } else {
+        if (getString(media, "url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
+        if (getString(media, "preview_image_url")) |url| try recordSkippedMediaAssetOnce(db, allocator, key, "preview_image", url, width, height, "{\"reason\":\"metadata_only_policy\"}");
+    }
+    if (getArray(media, "variants")) |variants| {
+        if (selectVideoVariant(variants)) |url| {
+            const kind = if (std.mem.eql(u8, getString(media, "type") orelse "", "animated_gif")) "animated_gif_variant" else "video_variant";
+            if (std.mem.eql(u8, media_policy, "all-local")) {
+                try downloadAsset(db, allocator, assets_dir, key, kind, url, width, height);
+            } else {
+                try recordRemoteOnlyMediaAssetOnce(db, allocator, key, kind, url, width, height, "{\"reason\":\"local_video_disabled_by_policy\"}");
             }
+        } else if (variants.items.len > 0) {
+            const source = try std.fmt.allocPrint(allocator, "x-bookmarks:media:{s}:variant", .{key});
+            defer allocator.free(source);
+            try recordSkippedMediaAssetOnce(db, allocator, key, "video_variant", source, width, height, "{\"reason\":\"no_mp4_variant\"}");
+        }
+    }
+}
+
+fn downloadAssetsForUserValue(db: *Db, allocator: std.mem.Allocator, assets_dir: []const u8, media_policy: []const u8, user: std.json.Value) !void {
+    const user_id = getString(user, "id") orelse "";
+    if (!std.mem.eql(u8, media_policy, "metadata-only") and getString(user, "profile_image_url") != null) {
+        const url = getString(user, "profile_image_url").?;
+        const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
+        defer allocator.free(key);
+        try downloadAsset(db, allocator, assets_dir, key, "author_avatar", url, null, null);
+    } else if (std.mem.eql(u8, media_policy, "metadata-only")) {
+        if (getString(user, "profile_image_url")) |url| {
+            const key = try std.fmt.allocPrint(allocator, "user:{s}", .{user_id});
+            defer allocator.free(key);
+            try recordSkippedMediaAssetOnce(db, allocator, key, "author_avatar", url, null, null, "{\"reason\":\"metadata_only_policy\"}");
         }
     }
 }
@@ -4414,14 +5396,17 @@ fn kbExportRawX(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, cha
         if (rc != c.SQLITE_ROW) return AppError.SqliteError;
         stats.total += 1;
         const tweet_id = colText(stmt, 0);
-        if (try kbRawXProcessedPathExists(allocator, paths, tweet_id)) {
-            stats.skipped_processed += 1;
-            continue;
-        }
-        const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
-        defer allocator.free(filename);
-        const path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", filename });
-        defer allocator.free(path);
+        const processed_target = try kbRawXProcessedTarget(allocator, paths, tweet_id);
+        defer if (processed_target) |target| target.deinit(allocator);
+        const raw_status = if (processed_target) |target| target.status else "inbox";
+        var inbox_path: ?[]const u8 = null;
+        defer if (inbox_path) |p| allocator.free(p);
+        const path = if (processed_target) |target| target.path else blk: {
+            const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
+            defer allocator.free(filename);
+            inbox_path = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", filename });
+            break :blk inbox_path.?;
+        };
         const data = try buildRawXBookmarkMarkdown(
             db,
             allocator,
@@ -4434,11 +5419,14 @@ fn kbExportRawX(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, cha
             colText(stmt, 6),
             colText(stmt, 7),
             colText(stmt, 8),
+            raw_status,
             colText(stmt, 9),
         );
         defer allocator.free(data);
         if (try writeKbRawFile(allocator, path, data, changed_only)) {
             stats.written += 1;
+        } else if (processed_target != null) {
+            stats.skipped_processed += 1;
         } else {
             stats.skipped_unchanged += 1;
         }
@@ -4446,15 +5434,25 @@ fn kbExportRawX(db: *Db, allocator: std.mem.Allocator, paths: ObsidianPaths, cha
     return stats;
 }
 
-fn kbRawXProcessedPathExists(allocator: std.mem.Allocator, paths: ObsidianPaths, tweet_id: []const u8) !bool {
+const KbRawXProcessedTarget = struct {
+    path: []const u8,
+    status: []const u8,
+
+    fn deinit(self: KbRawXProcessedTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+fn kbRawXProcessedTarget(allocator: std.mem.Allocator, paths: ObsidianPaths, tweet_id: []const u8) !?KbRawXProcessedTarget {
     const filename = try std.fmt.allocPrint(allocator, "{s}.md", .{tweet_id});
     defer allocator.free(filename);
     const ingested = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ingested", filename });
-    defer allocator.free(ingested);
-    if (fileExists(ingested)) return true;
+    if (fileExists(ingested)) return .{ .path = ingested, .status = "ingested" };
+    allocator.free(ingested);
     const ignored = try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "ignored", filename });
-    defer allocator.free(ignored);
-    return fileExists(ignored);
+    if (fileExists(ignored)) return .{ .path = ignored, .status = "ignored" };
+    allocator.free(ignored);
+    return null;
 }
 
 fn writeKbRawFile(allocator: std.mem.Allocator, path: []const u8, data: []const u8, changed_only: bool) !bool {
@@ -4480,12 +5478,15 @@ fn buildRawXBookmarkMarkdown(
     username: []const u8,
     author_name: []const u8,
     bookmarked_at: []const u8,
+    raw_status: []const u8,
     raw_json: []const u8,
 ) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch null;
     defer if (parsed) |*p| p.deinit();
     const root = if (parsed) |p| p.value else null;
     const post_text = rawXPostText(root, stored_text);
+    const thread_info = try loadThreadExportInfo(db, allocator, tweet_id, root);
+    defer thread_info.deinit(allocator);
     var urls = std.StringHashMap(void).init(allocator);
     defer {
         var it = urls.keyIterator();
@@ -4507,21 +5508,24 @@ fn buildRawXBookmarkMarkdown(
     try yamlString(w, "created_at", created_at);
     try yamlString(w, "bookmarked_at", bookmarked_at);
     try yamlStringArrayForQuery(db, allocator, w, "folders", "SELECT coalesce(f.name, bfi.folder_id) FROM bookmark_folder_items bfi LEFT JOIN bookmark_folders f ON f.account_user_id=bfi.account_user_id AND f.folder_id=bfi.folder_id WHERE bfi.tweet_id=? ORDER BY f.name, bfi.folder_id", tweet_id);
-    try yamlString(w, "status", "inbox");
+    try w.print("thread_candidate: {}\n", .{thread_info.candidate});
+    if (thread_info.candidate) {
+        try yamlString(w, "thread_expansion_status", thread_info.status);
+        if (thread_info.post_count > 0) try w.print("thread_post_count: {}\n", .{thread_info.post_count});
+        if (thread_info.method.len > 0) try yamlString(w, "thread_expansion_method", thread_info.method);
+        if (thread_info.confidence.len > 0) try yamlString(w, "thread_expansion_confidence", thread_info.confidence);
+    }
+    try yamlString(w, "status", raw_status);
     try w.writeAll("---\n\n");
     try w.print("# X Bookmark: @{s} / {s}\n\n", .{ if (username.len > 0) username else "unknown", tweet_id });
     try w.writeAll("## Post\n\n");
     try w.print("![]({s})\n\n", .{canonical_uri});
-    if (post_text.len > 0) {
-        try writeMarkdownEscaped(w, post_text);
-        try w.writeAll("\n\n");
-    } else {
-        try w.writeAll("_No post text stored._\n\n");
-    }
+    try writeSourceTextSection(db, allocator, w, tweet_id, post_text, thread_info);
     try writeRawWhyThisMayMatter(db, allocator, w, tweet_id, author_id, root, &urls);
     try writeRawLinksSection(w, canonical_uri, twitter_uri, &urls);
     try writeRawQuotePostSection(db, allocator, w, root);
     try writeRawMediaSection(db, w, tweet_id);
+    try writeRawThreadContext(db, allocator, w, tweet_id, thread_info);
     try w.writeAll("## Raw Metadata\n\n```json\n");
     try w.writeAll(raw_json);
     try w.writeAll("\n```\n");
@@ -4536,6 +5540,219 @@ fn rawXPostText(root: ?std.json.Value, fallback: []const u8) []const u8 {
         if (getString(value, "text")) |text| return text;
     }
     return fallback;
+}
+
+fn writeSourceTextSection(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, fallback_text: []const u8, info: ThreadExportInfo) !void {
+    try writer.writeAll("## Source Text\n\n");
+    if (info.candidate and (std.mem.eql(u8, info.status, "complete") or std.mem.eql(u8, info.status, "partial"))) {
+        if (try writeThreadSourceTextPosts(db, allocator, writer, tweet_id)) return;
+    }
+    if (fallback_text.len > 0) {
+        try writer.writeAll(fallback_text);
+        try writer.writeAll("\n\n");
+    } else {
+        try writer.writeAll("_No post text stored._\n\n");
+    }
+}
+
+fn writeThreadSourceTextPosts(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8) !bool {
+    const stmt = try db.prepare(
+        \\SELECT tp.position, coalesce(t.text, ''), t.raw_json
+        \\FROM thread_posts tp
+        \\JOIN tweets t ON t.tweet_id = tp.tweet_id
+        \\WHERE tp.root_tweet_id = ?
+        \\ORDER BY tp.position
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var wrote = false;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        wrote = true;
+        try writer.print("### Post {}\n\n", .{c.sqlite3_column_int64(stmt, 0)});
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(stmt, 2), .{}) catch null;
+        defer if (parsed) |*p| p.deinit();
+        const text = rawXPostText(if (parsed) |p| p.value else null, colText(stmt, 1));
+        if (text.len > 0) {
+            try writer.writeAll(text);
+            try writer.writeAll("\n\n");
+        } else {
+            try writer.writeAll("_No post text stored._\n\n");
+        }
+    }
+    return wrote;
+}
+
+const ThreadExportInfo = struct {
+    candidate: bool,
+    status: []const u8,
+    reason_json: []const u8,
+    method: []const u8,
+    confidence: []const u8,
+    post_count: i64,
+    estimated_cost_micros: i64,
+    query: []const u8,
+
+    fn deinit(self: ThreadExportInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.status);
+        allocator.free(self.reason_json);
+        allocator.free(self.method);
+        allocator.free(self.confidence);
+        allocator.free(self.query);
+    }
+};
+
+fn loadThreadExportInfo(db: *Db, allocator: std.mem.Allocator, tweet_id: []const u8, root: ?std.json.Value) !ThreadExportInfo {
+    var candidate = false;
+    var status: []const u8 = try allocator.dupe(u8, "");
+    var reason_json: []const u8 = try allocator.dupe(u8, "");
+    var method: []const u8 = try allocator.dupe(u8, "");
+    var confidence: []const u8 = try allocator.dupe(u8, "");
+    var query: []const u8 = try allocator.dupe(u8, "");
+    var post_count: i64 = 0;
+    var estimated_cost_micros: i64 = 0;
+
+    const cstmt = try db.prepare("SELECT reason_json, status FROM thread_candidates WHERE tweet_id=?");
+    defer _ = c.sqlite3_finalize(cstmt);
+    try bindText(cstmt, 1, tweet_id);
+    if (c.sqlite3_step(cstmt) == c.SQLITE_ROW) {
+        candidate = true;
+        allocator.free(reason_json);
+        reason_json = try allocator.dupe(u8, colText(cstmt, 0));
+        allocator.free(status);
+        status = try allocator.dupe(u8, colText(cstmt, 1));
+    } else if (root) |value| {
+        if (try threadDetectionReasonsJson(allocator, value)) |detected| {
+            candidate = true;
+            allocator.free(reason_json);
+            reason_json = detected;
+            allocator.free(status);
+            status = try allocator.dupe(u8, "missing");
+        }
+    }
+
+    const estmt = try db.prepare("SELECT status, coalesce(method, ''), coalesce(confidence, ''), post_count, coalesce(estimated_cost_micros, 0), coalesce(query, '') FROM thread_expansions WHERE root_tweet_id=?");
+    defer _ = c.sqlite3_finalize(estmt);
+    try bindText(estmt, 1, tweet_id);
+    if (c.sqlite3_step(estmt) == c.SQLITE_ROW) {
+        candidate = true;
+        allocator.free(status);
+        status = try allocator.dupe(u8, colText(estmt, 0));
+        allocator.free(method);
+        method = try allocator.dupe(u8, colText(estmt, 1));
+        allocator.free(confidence);
+        confidence = try allocator.dupe(u8, colText(estmt, 2));
+        post_count = c.sqlite3_column_int64(estmt, 3);
+        estimated_cost_micros = c.sqlite3_column_int64(estmt, 4);
+        allocator.free(query);
+        query = try allocator.dupe(u8, colText(estmt, 5));
+    }
+
+    if (candidate and status.len == 0) {
+        allocator.free(status);
+        status = try allocator.dupe(u8, "missing");
+    }
+    return .{
+        .candidate = candidate,
+        .status = status,
+        .reason_json = reason_json,
+        .method = method,
+        .confidence = confidence,
+        .post_count = post_count,
+        .estimated_cost_micros = estimated_cost_micros,
+        .query = query,
+    };
+}
+
+fn writeRawThreadContext(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, info: ThreadExportInfo) !void {
+    if (!info.candidate) return;
+    try writer.writeAll("## Thread Context\n\n");
+    try writer.writeAll("- Thread candidate: yes\n");
+    try writer.print("- Expansion status: {s}\n", .{info.status});
+    if (info.reason_json.len > 0) try writer.print("- Detection reason: `{s}`\n", .{info.reason_json});
+    if (info.method.len > 0) try writer.print("- Method: {s}\n", .{info.method});
+    if (info.confidence.len > 0) try writer.print("- Confidence: {s}\n", .{info.confidence});
+    if (info.post_count > 0) try writer.print("- Posts: {}\n", .{info.post_count});
+    if (info.estimated_cost_micros > 0) try writer.print("- Estimated X API cost: ${d:.3}\n", .{@as(f64, @floatFromInt(info.estimated_cost_micros)) / 1_000_000.0});
+    if (std.mem.eql(u8, info.status, "missing")) {
+        try writer.print("- Suggested command: `x-bookmarks threads expand --tweet-id {s} --dry-run`\n\n", .{tweet_id});
+        return;
+    }
+    try writer.writeAll("\n");
+    const stmt = try db.prepare(
+        \\SELECT tp.position, t.tweet_id, coalesce(t.canonical_uri, ''), coalesce(u.username, ''), coalesce(t.created_at, ''), coalesce(t.text, ''), t.raw_json
+        \\FROM thread_posts tp
+        \\JOIN tweets t ON t.tweet_id = tp.tweet_id
+        \\LEFT JOIN users u ON u.user_id = t.author_id
+        \\WHERE tp.root_tweet_id = ?
+        \\ORDER BY tp.position
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        try writer.print("### Thread Post {}\n\n", .{c.sqlite3_column_int64(stmt, 0)});
+        try writer.print("![]({s})\n\n", .{colText(stmt, 2)});
+        try writer.print("- Author: @{s}\n- Created: {s}\n- Tweet ID: {s}\n\n", .{ colText(stmt, 3), colText(stmt, 4), colText(stmt, 1) });
+        const raw = colText(stmt, 6);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+        defer if (parsed) |*p| p.deinit();
+        const text = rawXPostText(if (parsed) |p| p.value else null, colText(stmt, 5));
+        try writeMarkdownEscaped(writer, text);
+        try writer.writeAll("\n\n");
+        try writeThreadPostMediaRefs(db, writer, colText(stmt, 1));
+    }
+}
+
+fn writeThreadPostMediaRefs(db: *Db, writer: anytype, tweet_id: []const u8) !void {
+    const stmt = try db.prepare("SELECT media_key FROM tweet_media WHERE tweet_id=? ORDER BY position");
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        if (first) {
+            try writer.writeAll("Media:\n");
+            first = false;
+        }
+        try writer.print("- {s}\n", .{colText(stmt, 0)});
+    }
+    if (!first) try writer.writeAll("\n");
+}
+
+fn writeObsidianThreadSummary(db: *Db, allocator: std.mem.Allocator, writer: anytype, tweet_id: []const u8, info: ThreadExportInfo) !void {
+    if (!info.candidate or !(std.mem.eql(u8, info.status, "complete") or std.mem.eql(u8, info.status, "partial"))) return;
+    try writer.print("## Thread\n\nExpansion: {s}, {} posts", .{ info.status, info.post_count });
+    if (info.confidence.len > 0) try writer.print(", {s} confidence", .{info.confidence});
+    try writer.writeAll(".\n\n");
+    const stmt = try db.prepare(
+        \\SELECT tp.position, coalesce(t.text, ''), t.raw_json
+        \\FROM thread_posts tp
+        \\JOIN tweets t ON t.tweet_id = tp.tweet_id
+        \\WHERE tp.root_tweet_id = ?
+        \\ORDER BY tp.position
+        \\LIMIT 12
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, tweet_id);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return AppError.SqliteError;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, colText(stmt, 2), .{}) catch null;
+        defer if (parsed) |*p| p.deinit();
+        const text = rawXPostText(if (parsed) |p| p.value else null, colText(stmt, 1));
+        try writer.print("{}. ", .{c.sqlite3_column_int64(stmt, 0)});
+        try writeMarkdownEscaped(writer, shortText(text));
+        try writer.writeAll("\n");
+    }
+    try writer.writeAll("\n");
 }
 
 fn collectTweetUrls(allocator: std.mem.Allocator, tweet: std.json.Value, urls: *std.StringHashMap(void)) !void {
@@ -4956,6 +6173,8 @@ fn buildObsidianNote(
     defer if (parsed) |*p| p.deinit();
     const root = if (parsed) |p| p.value else null;
     const post_text = rawXPostText(root, text);
+    const thread_info = try loadThreadExportInfo(db, allocator, tweet_id, root);
+    defer thread_info.deinit(allocator);
     var out = std.ArrayList(u8).empty;
     const w = out.writer(allocator);
     const asset_error_count = try noteAssetErrorCount(db, tweet_id, author_id);
@@ -4972,6 +6191,12 @@ fn buildObsidianNote(
     try yamlString(w, "canonical_url", canonical_uri);
     try yamlString(w, "twitter_url", twitter_uri);
     try yamlStringArrayForQuery(db, allocator, w, "folders", "SELECT coalesce(f.name, bfi.folder_id) FROM bookmark_folder_items bfi LEFT JOIN bookmark_folders f ON f.account_user_id=bfi.account_user_id AND f.folder_id=bfi.folder_id WHERE bfi.tweet_id=? ORDER BY f.name, bfi.folder_id", tweet_id);
+    try w.print("thread_candidate: {}\n", .{thread_info.candidate});
+    if (thread_info.candidate) {
+        try yamlString(w, "thread_expansion_status", thread_info.status);
+        if (thread_info.post_count > 0) try w.print("thread_post_count: {}\n", .{thread_info.post_count});
+        if (thread_info.confidence.len > 0) try yamlString(w, "thread_expansion_confidence", thread_info.confidence);
+    }
     try w.print("complete_for_offline_render: {}\n", .{complete});
     try yamlString(w, "media_status", media_status);
     try w.print("asset_error_count: {}\n", .{asset_error_count});
@@ -4981,10 +6206,10 @@ fn buildObsidianNote(
     try w.writeAll("---\n\n<!-- x-bookmarks:generated:start -->\n");
     try w.print("# @{s}\n\n", .{if (username.len > 0) username else "unknown"});
     try w.print("![]({s})\n\n", .{canonical_uri});
-    try writeMarkdownEscaped(w, post_text);
-    try w.writeAll("\n\n");
+    try writeSourceTextSection(db, allocator, w, tweet_id, post_text, thread_info);
     try writeQuotePostsMarkdown(db, allocator, w, raw_json);
     try writeTweetMediaMarkdown(db, allocator, w, tweet_id, canonical_uri, asset_map);
+    try writeObsidianThreadSummary(db, allocator, w, tweet_id, thread_info);
     try w.print("\n[Open on X]({s})\n\n", .{canonical_uri});
     try writeMediaRetrievalTable(db, allocator, w, tweet_id, author_id, canonical_uri, asset_map);
     try w.writeAll("<!-- x-bookmarks:generated:end -->\n\n## Notes\n\n<!-- User notes below this line are preserved by x-bookmarks. -->\n");
@@ -5042,7 +6267,7 @@ fn mergeGeneratedNote(allocator: std.mem.Allocator, path: []const u8, generated:
     const generated_end = std.mem.indexOf(u8, generated, end_marker) orelse generated.len;
     var out = std.ArrayList(u8).empty;
     const w = out.writer(allocator);
-    try w.writeAll(generated[0 .. @min(generated.len, generated_end + end_marker.len)]);
+    try w.writeAll(generated[0..@min(generated.len, generated_end + end_marker.len)]);
     try w.writeAll(existing[preserve_start..]);
     return out.toOwnedSlice(allocator);
 }
@@ -5491,8 +6716,6 @@ fn markMediaAssetRemoved(db: *Db, allocator: std.mem.Allocator, id: i64) !void {
     _ = c.sqlite3_bind_int64(stmt, 3, id);
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return AppError.SqliteError;
 }
-
-
 
 fn assetsVerify(db: *Db, allocator: std.mem.Allocator) !void {
     const stmt = try db.prepare("SELECT id, local_path, coalesce(byte_size, -1), coalesce(sha256, ''), status FROM media_assets WHERE status IN ('downloaded', 'ok')");
@@ -7334,9 +8557,11 @@ test "kb raw X export does not move processed sources back to inbox" {
 
     const stats = try kbExportRawX(&db, allocator, paths, true);
     try std.testing.expectEqual(@as(u32, 1), stats.total);
-    try std.testing.expectEqual(@as(u32, 0), stats.written);
-    try std.testing.expectEqual(@as(u32, 1), stats.skipped_processed);
+    try std.testing.expectEqual(@as(u32, 1), stats.written);
+    try std.testing.expectEqual(@as(u32, 0), stats.skipped_processed);
     try std.testing.expect(!fileExists(try std.fs.path.join(allocator, &.{ paths.root, "raw", "x", "inbox", "950.md" })));
+    const updated = try std.fs.cwd().readFileAlloc(allocator, ingested_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "status: \"ingested\"") != null);
 }
 
 test "missing quoted post references preserve protected error status" {
@@ -8066,4 +9291,301 @@ test "viewer export file validation requires static shell and data manifests" {
     try ensureParentDir(asset_path);
     try std.fs.cwd().writeFile(.{ .sub_path = asset_path, .data = "console.log('ok');" });
     try validateViewerExportFiles(allocator, export_dir);
+}
+
+test "thread candidate detection catches numbering and markers only" {
+    const allocator = std.testing.allocator;
+    var numbered = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"1","author_id":"a","conversation_id":"1","text":"A useful opener 1/N","public_metrics":{"reply_count":2}}
+    , .{});
+    defer numbered.deinit();
+    const numbered_reasons = try threadDetectionReasonsJson(allocator, numbered.value);
+    defer if (numbered_reasons) |r| allocator.free(r);
+    try std.testing.expect(numbered_reasons != null);
+    try std.testing.expect(std.mem.indexOf(u8, numbered_reasons.?, "1/N") != null);
+
+    var marker = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"2\",\"author_id\":\"a\",\"conversation_id\":\"2\",\"text\":\"\\uD83E\\uDDF5 notes on systems\"}", .{});
+    defer marker.deinit();
+    const marker_reasons = try threadDetectionReasonsJson(allocator, marker.value);
+    defer if (marker_reasons) |r| allocator.free(r);
+    try std.testing.expect(marker_reasons != null);
+
+    var ordinary = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"3","author_id":"a","conversation_id":"3","text":"One ordinary standalone post","public_metrics":{"reply_count":10}}
+    , .{});
+    defer ordinary.deinit();
+    const ordinary_reasons = try threadDetectionReasonsJson(allocator, ordinary.value);
+    try std.testing.expect(ordinary_reasons == null);
+}
+
+test "thread membership keeps same-author chain and excludes comments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "threads.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var author = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer author.deinit();
+    try upsertUserFromValue(&db, allocator, author.value);
+    var commenter = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"2\",\"username\":\"bob\",\"name\":\"Bob\"}", .{});
+    defer commenter.deinit();
+    try upsertUserFromValue(&db, allocator, commenter.value);
+
+    const tweets = [_][]const u8{
+        \\{"id":"100","author_id":"1","conversation_id":"100","created_at":"2026-05-14T10:00:00.000Z","text":"Thread opener 1/N"}
+        ,
+        \\{"id":"101","author_id":"1","conversation_id":"100","created_at":"2026-05-14T10:01:00.000Z","text":"Second post","referenced_tweets":[{"type":"replied_to","id":"100"}]}
+        ,
+        \\{"id":"102","author_id":"2","conversation_id":"100","created_at":"2026-05-14T10:02:00.000Z","text":"A comment","referenced_tweets":[{"type":"replied_to","id":"100"}]}
+        ,
+        \\{"id":"103","author_id":"1","conversation_id":"100","created_at":"2026-05-14T10:03:00.000Z","text":"Third post","referenced_tweets":[{"type":"replied_to","id":"101"}]}
+        ,
+        \\{"id":"104","author_id":"1","conversation_id":"100","created_at":"2026-05-14T10:04:00.000Z","text":"Side reply","referenced_tweets":[{"type":"replied_to","id":"999"}]}
+    };
+    for (tweets) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        try upsertTweetFromValue(&db, allocator, parsed.value);
+    }
+
+    const plan = ThreadExpansionPlan{
+        .root_tweet_id = "100",
+        .root_author_id = "1",
+        .root_author_username = "alice",
+        .conversation_id = "100",
+        .query = "conversation_id:100 from:alice",
+        .start_time = "2026-05-14T10:00:00Z",
+        .end_time = "2026-05-14T16:00:00Z",
+        .endpoint = .all,
+        .max_results = 100,
+        .max_posts = default_thread_max_posts,
+        .estimated_cost_micros = 100000,
+    };
+    const result = try buildAndPersistThreadMembership(&db, allocator, plan);
+    try std.testing.expectEqualStrings("complete", result.status);
+    try std.testing.expectEqual(@as(i64, 3), try scalarCount(&db, "SELECT count(*) FROM thread_posts WHERE root_tweet_id='100'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(&db, "SELECT count(*) FROM thread_posts WHERE tweet_id IN ('102','104')"));
+}
+
+test "thread membership caps kept posts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "thread-cap.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var author = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer author.deinit();
+    try upsertUserFromValue(&db, allocator, author.value);
+
+    var root = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"500","author_id":"1","conversation_id":"500","created_at":"2026-05-14T10:00:00.000Z","text":"Thread opener 1/N"}
+    , .{});
+    defer root.deinit();
+    try upsertTweetFromValue(&db, allocator, root.value);
+    for (1..8) |idx| {
+        const id = try std.fmt.allocPrint(allocator, "50{}", .{idx});
+        defer allocator.free(id);
+        const previous_id = if (idx == 1) try allocator.dupe(u8, "500") else try std.fmt.allocPrint(allocator, "50{}", .{idx - 1});
+        defer allocator.free(previous_id);
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":\"{s}\",\"author_id\":\"1\",\"conversation_id\":\"500\",\"created_at\":\"2026-05-14T10:0{}:00.000Z\",\"text\":\"Post {}\",\"referenced_tweets\":[{{\"type\":\"replied_to\",\"id\":\"{s}\"}}]}}",
+            .{ id, idx, idx, previous_id },
+        );
+        defer allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        try upsertTweetFromValue(&db, allocator, parsed.value);
+    }
+
+    const plan = ThreadExpansionPlan{
+        .root_tweet_id = "500",
+        .root_author_id = "1",
+        .root_author_username = "alice",
+        .conversation_id = "500",
+        .query = "conversation_id:500 from:alice",
+        .start_time = "2026-05-14T10:00:00Z",
+        .end_time = "2026-05-14T16:00:00Z",
+        .endpoint = .timeline,
+        .max_results = 100,
+        .max_posts = 5,
+        .estimated_cost_micros = 100000,
+    };
+    const result = try buildAndPersistThreadMembership(&db, allocator, plan);
+    try std.testing.expectEqualStrings("partial", result.status);
+    try std.testing.expectEqual(@as(u32, 5), result.post_count);
+    try std.testing.expectEqual(@as(i64, 5), try scalarCount(&db, "SELECT count(*) FROM thread_posts WHERE root_tweet_id='500'"));
+}
+
+test "thread timeline url uses root author and time window" {
+    const allocator = std.testing.allocator;
+    const start = try threadApiStartTime(allocator, "2026-05-14T22:30:00.000Z");
+    defer allocator.free(start);
+    const end = try threadApiEndTime(allocator, start, 6);
+    defer allocator.free(end);
+    try std.testing.expectEqualStrings("2026-05-14T22:30:00Z", start);
+    try std.testing.expectEqualStrings("2026-05-15T04:30:00Z", end);
+
+    const plan = ThreadExpansionPlan{
+        .root_tweet_id = "600",
+        .root_author_id = "1",
+        .root_author_username = "alice",
+        .conversation_id = "600",
+        .query = "conversation_id:600 from:alice",
+        .start_time = start,
+        .end_time = end,
+        .endpoint = .timeline,
+        .max_results = 100,
+        .max_posts = default_thread_max_posts,
+        .estimated_cost_micros = 100000,
+    };
+    const url = try buildThreadSearchUrl(allocator, plan);
+    defer allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "/2/users/1/tweets?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "start_time=2026-05-14T22%3A30%3A00Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "end_time=2026-05-15T04%3A30%3A00Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "in_reply_to_user_id") != null);
+}
+
+test "raw export emits missing and complete thread context" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "raw-thread.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var author = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer author.deinit();
+    try upsertUserFromValue(&db, allocator, author.value);
+    var root = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"200","author_id":"1","conversation_id":"200","created_at":"2026-05-14T10:00:00.000Z","text":"Thread opener 1/N","public_metrics":{"reply_count":4}}
+    , .{});
+    defer root.deinit();
+    try upsertTweetFromValue(&db, allocator, root.value);
+    const missing_raw_json = try jsonValueAlloc(allocator, root.value);
+    defer allocator.free(missing_raw_json);
+    const missing = try buildRawXBookmarkMarkdown(&db, allocator, "200", "https://x.com/alice/status/200", "https://twitter.com/i/web/status/200", "Thread opener 1/N", "2026-05-14T10:00:00.000Z", "1", "alice", "Alice", "2026-05-14", "inbox", missing_raw_json);
+    defer allocator.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "thread_candidate: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "thread_expansion_status: \"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "## Source Text\n\nThread opener 1/N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "## Thread Context") != null);
+
+    var second = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"201","author_id":"1","conversation_id":"200","created_at":"2026-05-14T10:01:00.000Z","text":"Second post","referenced_tweets":[{"type":"replied_to","id":"200"}]}
+    , .{});
+    defer second.deinit();
+    try upsertTweetFromValue(&db, allocator, second.value);
+    var comment = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"202","author_id":"2","conversation_id":"200","created_at":"2026-05-14T10:02:00.000Z","text":"Comment","referenced_tweets":[{"type":"replied_to","id":"200"}]}
+    , .{});
+    defer comment.deinit();
+    try upsertTweetFromValue(&db, allocator, comment.value);
+    const plan = ThreadExpansionPlan{
+        .root_tweet_id = "200",
+        .root_author_id = "1",
+        .root_author_username = "alice",
+        .conversation_id = "200",
+        .query = "conversation_id:200 from:alice",
+        .start_time = "2026-05-14T10:00:00Z",
+        .end_time = "2026-05-14T16:00:00Z",
+        .endpoint = .all,
+        .max_results = 100,
+        .max_posts = default_thread_max_posts,
+        .estimated_cost_micros = 100000,
+    };
+    const build = try buildAndPersistThreadMembership(&db, allocator, plan);
+    try upsertThreadExpansionStatus(&db, allocator, plan, build.status, build.confidence, build.post_count, 2, null);
+    const raw_json = try jsonValueAlloc(allocator, root.value);
+    defer allocator.free(raw_json);
+    const complete = try buildRawXBookmarkMarkdown(&db, allocator, "200", "https://x.com/alice/status/200", "https://twitter.com/i/web/status/200", "Thread opener 1/N", "2026-05-14T10:00:00.000Z", "1", "alice", "Alice", "2026-05-14", "inbox", raw_json);
+    defer allocator.free(complete);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "thread_expansion_status: \"complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "## Source Text\n\n### Post 1\n\nThread opener 1/N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "### Post 2\n\nSecond post") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "### Thread Post 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "Second post") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete, "Comment") == null);
+}
+
+test "thread search ingestion persists filtered same-author results only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "thread-ingest.sqlite" });
+    defer allocator.free(db_path);
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+
+    var author = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":\"1\",\"username\":\"alice\",\"name\":\"Alice\"}", .{});
+    defer author.deinit();
+    try upsertUserFromValue(&db, allocator, author.value);
+    var root = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"300","author_id":"1","conversation_id":"300","created_at":"2026-05-14T10:00:00.000Z","text":"Thread opener 1/N"}
+    , .{});
+    defer root.deinit();
+    try upsertTweetFromValue(&db, allocator, root.value);
+
+    const plan = ThreadExpansionPlan{
+        .root_tweet_id = "300",
+        .root_author_id = "1",
+        .root_author_username = "alice",
+        .conversation_id = "300",
+        .query = "conversation_id:300 from:alice",
+        .start_time = "2026-05-14T10:00:00Z",
+        .end_time = "2026-05-14T16:00:00Z",
+        .endpoint = .recent,
+        .max_results = 100,
+        .max_posts = default_thread_max_posts,
+        .estimated_cost_micros = 100000,
+    };
+    var response = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "data": [
+        \\    {"id":"301","author_id":"1","conversation_id":"300","created_at":"2026-05-14T10:01:00.000Z","text":"Second post","referenced_tweets":[{"type":"replied_to","id":"300"}]},
+        \\    {"id":"302","author_id":"2","conversation_id":"300","created_at":"2026-05-14T10:02:00.000Z","text":"Comment","referenced_tweets":[{"type":"replied_to","id":"300"}]}
+        \\  ],
+        \\  "includes": {
+        \\    "users": [{"id":"2","username":"bob","name":"Bob"}],
+        \\    "tweets": [{"id":"303","author_id":"2","conversation_id":"300","created_at":"2026-05-14T10:03:00.000Z","text":"Included comment"}]
+        \\  }
+        \\}
+    , .{});
+    defer response.deinit();
+    try ingestThreadSearchResponse(&db, allocator, response.value, plan);
+    try std.testing.expect(try tweetExists(&db, "301"));
+    try std.testing.expect(!try tweetExists(&db, "302"));
+    try std.testing.expect(!try tweetExists(&db, "303"));
+}
+
+test "cached complete thread expansion is skipped by default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "thread-cache.sqlite" });
+    var db = try Db.open(db_path, allocator);
+    defer db.close();
+    try applyMigrations(&db);
+    try db.exec(
+        \\INSERT INTO thread_expansions(root_tweet_id, root_author_id, root_author_username, conversation_id, status, method, confidence, post_count, first_seen_at, last_seen_at)
+        \\VALUES ('400', '1', 'alice', '400', 'complete', 'search_all', 'high', 2, 'now', 'now');
+    );
+    const paths = Paths{ .config_path = "config.json", .config_dir = ".", .state_dir = "." };
+    const cfg = try Config.default(allocator, paths, null);
+    const processed = try expandThreads(&db, allocator, cfg, null, .{ .tweet_id = "400", .yes = true });
+    try std.testing.expectEqual(@as(u32, 0), processed);
 }

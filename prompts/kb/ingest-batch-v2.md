@@ -42,7 +42,7 @@ The wiki should not feel like an ingestion trace. It should feel like an Obsidia
 
 For each raw bookmark:
 
-1. Read the full raw source, including article metadata, quote posts, links, and media descriptions.
+1. Read the full raw source, including article metadata, quote posts, links, media descriptions, and `## Thread Context` when present.
 2. Identify the durable subject, if any.
 3. Search `~/src/brain2/X Bookmarks/wiki/` for related existing pages before creating new ones.
 4. Decide one of:
@@ -54,6 +54,12 @@ For each raw bookmark:
 5. Prefer updating existing pages over creating one-source fragments.
 6. If a source complicates an existing claim, add a `Contradictions / Caveats` note instead of overwriting the earlier claim.
 7. Cite raw sources from any page you update, using an inline X embed plus a dated aliased Obsidian wikilink so the rendered text is readable and the wiki graph still has a markdown source link.
+
+If a raw source has expanded thread context, analyze the whole thread as part of
+that captured bookmark source and note that the citation includes thread
+context. If `thread_expansion_status` is `missing`, add a follow-up source
+collection task to expand the thread before final synthesis; do not pretend the
+rest of the thread was inspected.
 
 ## Page Quality
 
