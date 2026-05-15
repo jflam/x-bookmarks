@@ -30,6 +30,7 @@ export default {
           sourcePath: selected.rawPath,
           sourceMarkdown: context.sourceMarkdown,
           interestMapMarkdown: context.interestMapMarkdown,
+          priorDecisionContext: context.priorDecisionContext,
           candidatePages: context.candidatePages,
         }),
         KbSensemakingDecisionType,

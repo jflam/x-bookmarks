@@ -13,7 +13,8 @@ For each source, the agent receives:
 
 - the raw X bookmark Markdown;
 - the current `wiki/meta/interest-map.md`;
-- candidate related wiki pages or prior context where available.
+- deterministic prior-decision context from SQLite;
+- candidate related wiki pages where available.
 
 The agent then answers:
 
@@ -119,6 +120,33 @@ It does not currently store the full Markdown map. The Markdown file remains the
 human-editable artifact. SQLite stores compact metadata and a JSON summary for
 inspection and future retrieval.
 
+### SQLite Interest Map Entries
+
+The normalized routing table is:
+
+```sql
+kb_interest_map_entries
+```
+
+It stores queryable state for each map entry:
+
+```text
+interest_id
+name
+description
+status
+aliases_json
+parent_interest_id
+example_sources_json
+source_count
+confidence_json
+created_at
+updated_at
+```
+
+`interest-map.md` remains the human-facing artifact. This table is used by
+verification, reconciliation, and prior-decision retrieval.
+
 ## Current Flow
 
 ```mermaid
@@ -133,8 +161,8 @@ sequenceDiagram
 
     Proc->>Raw: Read source Markdown
     Proc->>Map: Read current interest map
-    Proc->>DB: Optionally inspect prior decisions / metadata
-    Proc->>Agent: Send source + interest map + candidates
+    Proc->>DB: Retrieve compact prior decisions
+    Proc->>Agent: Send source + interest map + prior decisions + candidates
 
     Agent->>Agent: Understand source from source text
     Agent->>Agent: Compare source to existing interests
@@ -147,6 +175,7 @@ sequenceDiagram
     Proc->>DB: Upsert kb_ingest_decisions
     Proc->>DB: Read all stored decisions in stable order
     Proc->>NewMap: Regenerate wiki/meta/interest-map.md
+    Proc->>DB: Upsert kb_interest_map_entries
     Proc->>DB: Insert kb_interest_map_revisions row
 ```
 
@@ -172,10 +201,31 @@ John's saved-bookmark patterns?
 
 ## Deterministic Refresh
 
-The current refresh path is deterministic in the narrow sense that it reads
-`kb_ingest_decisions` in stable `source_id` order, groups matched interests,
-dedupes recurring questions, renders Markdown source links, and inserts a
-revision metadata row.
+The refresh path reads `kb_ingest_decisions` in stable `source_id` order, groups
+matched interests by stable interest ID, preserves existing manual names,
+descriptions, aliases, and seeded entries where possible, dedupes recurring
+questions, renders Markdown source links relative to `wiki/meta/interest-map.md`,
+upserts `kb_interest_map_entries`, inserts a revision row, and runs the verifier.
+
+The map shape is:
+
+```markdown
+### agentic-coding-workflows
+
+- Name: Agentic Coding Workflows
+- Status: active
+- Description: ...
+- Aliases: coding agents, AI coding workflows
+- Parent interest: none
+- Related interests: agent-orchestration
+- Source count: 6
+- Confidence: {"high":4,"medium":2}
+- Manually seeded: no
+- Example sources: [2013164033726120070](../../raw/x/ingested/2013164033726120070.md)
+- Signals: ...
+```
+
+IDs are lowercase slugs and should remain stable even when display names improve.
 
 The map currently uses generated Markdown links like:
 
@@ -188,31 +238,75 @@ back to the raw source tree.
 
 ## What SQLite Does And Does Not Store
 
-SQLite stores the ingest decisions and interest-map revision metadata.
-
-SQLite does not currently store a normalized interest-map ontology such as:
-
-```text
-interest_id
-interest_name
-description
-parent_interest_id
-status
-source_count
-example_sources
-manual_aliases
-```
-
-That means the current map can be regenerated from decisions, but it is not yet a
-fully queryable or manually reconciled interest graph.
-
-The practical current model is:
+SQLite stores the ingest decisions, normalized interest entries, and map revision
+metadata. The practical ownership model is:
 
 ```text
 kb_ingest_decisions -> deterministic map renderer -> interest-map.md
+interest-map.md -> reconcile -> kb_interest_map_entries
+kb_interest_map_revisions -> compact summaries and audit trail
 ```
 
-Manual edits to `interest-map.md` are not yet parsed back into SQLite.
+Manual edits to `interest-map.md` are parsed by the reconcile path before they
+become machine-readable state.
+
+## Manual Edit Workflow
+
+Use the Nanoboss maintenance procedure:
+
+```bash
+nanoboss xbookmarks/wiki-interest-map "reconcile --dry-run"
+nanoboss xbookmarks/wiki-interest-map "reconcile --yes"
+```
+
+Dry run reports new interest IDs, renamed interests, alias changes, deprecated
+interests, invalid source links, and entries that cannot be parsed safely. Apply
+mode upserts parsed entries into `kb_interest_map_entries` only when the map has
+no unsafe parse errors or invalid source links.
+
+## Verifier
+
+Run:
+
+```bash
+nanoboss xbookmarks/wiki-interest-map "verify"
+```
+
+The verifier checks:
+
+- every example source link resolves from `wiki/meta/interest-map.md`;
+- every example source has a `kb_ingest_decisions` row;
+- map source counts match `kb_interest_map_entries`;
+- deferred-media counts match `kb_ingest_decisions`;
+- recurring questions are deduped;
+- placeholder headings such as `No strong match` are not core interests;
+- every interest has an ID, name, status, and description;
+- every active interest has at least one example source or `Manually seeded: yes`.
+
+Verifier artifacts are written to:
+
+```text
+.nanoboss/xbookmarks/runs/<run-id>/interest-map-verify.md
+.nanoboss/xbookmarks/runs/<run-id>/interest-map-verify.json
+```
+
+## Prior-Decision Retrieval
+
+Use:
+
+```bash
+nanoboss xbookmarks/wiki-interest-map "prior-decisions --source raw/x/ingested/ID.md --limit 12"
+```
+
+The retrieval helper is also used automatically when sensemaking prompts are
+built. It scores prior decisions by deterministic keyword overlap with interest
+IDs, names, aliases, and matched-interest text, plus same-author and
+media-primary/deferred-media signals.
+
+Returned context includes source ID, raw path, Markdown link, status, why saved,
+matched interests, non-obvious connections, confidence, defer reason, score, and
+retrieval reasons. It is context only; source-grounded understanding still comes
+from the current source markdown.
 
 ## How This Supports Phase Two
 
@@ -233,43 +327,35 @@ before large-scale phase-two ingestion.
 
 ## Recommended Improvements Before Phase Two
 
-### 1. Add Stable Interest IDs
+### 1. Stable Interest IDs
 
-Interest headings are currently strings. Similar names can drift or duplicate.
-
-Before phase two, add stable IDs in the map and summary JSON:
+The map uses stable IDs in headings and revision summary JSON:
 
 ```markdown
 ### agentic-coding-workflows
 
 - Name: Agentic Coding Workflows
+- Status: active
 - Description: ...
 - Example sources: ...
 ```
 
 This makes future matching less sensitive to wording changes.
 
-### 2. Parse Manual Map Edits
+### 2. Manual Map Edits
 
-The map is human-editable, but edits are not currently ingested back into SQLite.
-
-Phase two should support a refresh step that reads the Markdown map and extracts:
+The reconcile path reads the Markdown map and extracts:
 
 - interest IDs;
 - preferred names;
 - descriptions;
 - aliases;
-- manual merges or splits;
+- parent/related interests;
 - deprecated interests.
 
-Without this, human corrections can guide prompts but not reliably update the
-machine-readable state.
+### 3. Richer Map Representation In SQLite
 
-### 3. Store A Richer Map Representation In SQLite
-
-Add a normalized table or richer JSON summary for interest-map entries.
-
-Possible table:
+The normalized table is:
 
 ```sql
 CREATE TABLE IF NOT EXISTS kb_interest_map_entries (
@@ -278,18 +364,20 @@ CREATE TABLE IF NOT EXISTS kb_interest_map_entries (
   description TEXT,
   status TEXT NOT NULL,
   aliases_json TEXT,
+  parent_interest_id TEXT,
   example_sources_json TEXT,
   source_count INTEGER NOT NULL DEFAULT 0,
+  confidence_json TEXT,
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 ```
 
-This would make the interest map easier to query, diff, test, and use for
-retrieval.
+This makes the interest map easier to query, diff, test, and use for retrieval.
 
-### 4. Add A Map Verifier
+### 4. Map Verifier
 
-Before phase two, add a verifier that checks:
+The verifier checks:
 
 - every example source link resolves;
 - every example source has a decision row;
@@ -299,7 +387,7 @@ Before phase two, add a verifier that checks:
 - no obvious placeholder headings such as "No strong match" appear as core
   interests.
 
-This should run after every interest-map refresh.
+It runs after every interest-map refresh.
 
 ### 5. Improve Interest Clustering
 
@@ -347,7 +435,8 @@ sequenceDiagram
 
     loop For each source in batch
         Proc->>Source: Load source Markdown
-        Proc->>Agent: Prompt with source + map + candidates
+        Proc->>DB: Retrieve deterministic prior decisions
+        Proc->>Agent: Prompt with source + map + prior decisions + candidates
         Agent-->>Proc: Typed decision
         Proc->>Source: Render Ingest Decision
         Proc->>DB: Store decision
@@ -355,9 +444,35 @@ sequenceDiagram
 
     Proc->>DB: Regenerate map inputs from decisions
     Proc->>Map: Refresh interest-map.md
-    Proc->>DB: Store revision summary
+    Proc->>DB: Store entries and revision summary
+    Proc->>Report: Run verifier
     Proc->>Report: Write batch quality/drift report
 ```
+
+## Shadow Replay
+
+Before phase two, run a 10-20 source dry-run replay:
+
+```bash
+nanoboss xbookmarks/wiki-baseline-replay \
+  --split wiki/meta/corpus-split.json \
+  --limit 20 \
+  --map wiki/meta/interest-map.md \
+  --dry-run \
+  --write-comparison-report
+```
+
+Replay artifacts are written to:
+
+```text
+.nanoboss/xbookmarks/runs/<run-id>/baseline-replay-decisions.jsonl
+.nanoboss/xbookmarks/runs/<run-id>/baseline-replay-comparison.md
+.nanoboss/xbookmarks/runs/<run-id>/baseline-replay-comparison.json
+```
+
+Replay mode does not mutate source pages or `kb_ingest_decisions`. The report
+compares why-saved text, matched interests, non-obvious connections, actions,
+confidence, deferrals, ignored status, and which prior decisions were included.
 
 ## Bottom Line
 
@@ -366,8 +481,9 @@ The intended design is:
 ```text
 interest-map.md guides the agent;
 kb_ingest_decisions preserves every source-level decision;
-refreshInterestMap deterministically regenerates the map;
-kb_interest_map_revisions records map refresh metadata.
+kb_interest_map_entries stores queryable routing state;
+refreshInterestMap deterministically regenerates and verifies the map;
+kb_interest_map_revisions records map refresh metadata and compact summaries.
 ```
 
 Before phase two, the most important improvement is to make the interest map a

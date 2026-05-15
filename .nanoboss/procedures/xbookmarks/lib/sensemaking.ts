@@ -4,6 +4,19 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 
 import { parseFrontmatter } from "./frontmatter.ts";
 import { ensureInsideRoot, fileExists, listMarkdownFiles, readTextIfExists, toPosixRelative, writeJson, writeTextAtomic } from "./fs.ts";
+import {
+  buildInterestMapEntries,
+  buildPriorDecisionContext,
+  cleanGeneratedText,
+  ensureInterestMapTables,
+  inferredInterestsFromActions,
+  parseInterestMapMarkdown,
+  parseJsonArray,
+  renderInterestMap,
+  upsertInterestMapEntries,
+  verifyInterestMap,
+  usefulInterestName,
+} from "./interest-map.ts";
 import type { BaselineBuildResult, KbSensemakingDecision, MatchedInterest, NonObviousConnection, SelectedBookmark, SensemakingAction, XBookmarksConfig } from "./types.ts";
 
 const ACTION_KINDS = new Set([
@@ -65,12 +78,15 @@ export async function readSelectedBookmarkAt(rawPath: string): Promise<SelectedB
   };
 }
 
-export async function buildSensemakingPromptContext(config: XBookmarksConfig, selected: SelectedBookmark) {
+export async function buildSensemakingPromptContext(config: XBookmarksConfig, selected: SelectedBookmark, options?: { interestMapMarkdown?: string }) {
   const sourceMarkdown = await readFile(selected.rawPath, "utf8");
   const interestMapPath = join(config.managedRoot, "wiki", "meta", "interest-map.md");
-  const interestMapMarkdown = await readTextIfExists(interestMapPath);
+  const interestMapMarkdown = options?.interestMapMarkdown ?? await readTextIfExists(interestMapPath);
   const candidatePages = await candidatePagesForSource(config.managedRoot, selected, sourceMarkdown);
-  return { sourceMarkdown, interestMapMarkdown, candidatePages };
+  const priorDecisionContext = config.databasePath
+    ? await buildPriorDecisionContext(config, selected, interestMapMarkdown, 12)
+    : undefined;
+  return { sourceMarkdown, interestMapMarkdown, candidatePages, priorDecisionContext };
 }
 
 export async function applySensemakingDecision(params: {
@@ -206,94 +222,39 @@ export async function refreshInterestMap(config: XBookmarksConfig, revisionLabel
     FROM kb_ingest_decisions
     ORDER BY source_id
   `).all() as Array<Record<string, string | null>>;
-  const byInterest = new Map<string, Array<{ sourceId: string; rawPath: string; why: string; match: MatchedInterest }>>();
-  const recurringQuestions = new Set<string>();
-  const tools = new Set<string>();
-  const deferred: string[] = [];
-  for (const row of rows) {
-    const actions = parseJsonArray<SensemakingAction>(row.actions_json);
-    const storedMatches = parseJsonArray<MatchedInterest>(row.matched_interests_json).filter((item) => usefulInterestName(item.interest));
-    const matches = storedMatches.length > 0 ? storedMatches : inferredInterestsFromActions(actions, String(row.why_saved ?? ""));
-    for (const match of matches) {
-      const key = titleCaseInterest(match.interest);
-      const items = byInterest.get(key) ?? [];
-      items.push({
-        sourceId: String(row.source_id),
-        rawPath: String(row.raw_path),
-        why: String(row.why_saved ?? ""),
-        match,
-      });
-      byInterest.set(key, items);
-    }
-    for (const action of actions) {
-      if (action.kind === "create_or_update_open_question" && action.title) recurringQuestions.add(action.title);
-      if ((action.kind === "create_new_page" || action.kind === "add_evidence_to_page") && action.page?.includes("tools/")) tools.add(action.title ?? action.page);
-    }
-    if (row.status === "deferred_media_inspection" && row.defer_reason) deferred.push(`${row.source_id}: ${row.defer_reason}`);
-  }
-  const interestEntries = [...byInterest.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
-  const revisionSummary = {
-    interests: interestEntries.map(([interest, items]) => ({
-      interest,
-      source_count: items.length,
-      example_sources: items.slice(0, 5).map((item) => item.sourceId),
-    })),
-    deferred_media_inspection_count: deferred.length,
-    recurring_question_count: recurringQuestions.size,
-    source_count: rows.length,
-  };
-  const markdown = [
-    "# Interest Map",
-    "",
-    `Generated: ${new Date().toISOString()}`,
-    `Revision: ${revisionLabel}`,
-    `Sources with decisions: ${rows.length}`,
-    "",
-    "## Core Interests",
-    "",
-    ...(interestEntries.length ? interestEntries.flatMap(([interest, items]) => renderInterest(interest, items)) : ["_No matched interests recorded yet._", ""]),
-    "## Recurring Questions",
-    "",
-    ...(recurringQuestions.size ? [...recurringQuestions].sort().map((question) => `- ${question}`) : ["_No recurring questions recorded yet._"]),
-    "",
-    "## People And Organizations",
-    "",
-    "_Derived people and organization clustering is reserved for inspection after the baseline run._",
-    "",
-    "## Tools And Technical Stacks",
-    "",
-    ...(tools.size ? [...tools].sort().map((tool) => `- ${tool}`) : ["_No tool-specific interests recorded yet._"]),
-    "",
-    "## Aesthetic And Product Preferences",
-    "",
-    "_No explicit aesthetic/product preference cluster has been promoted yet._",
-    "",
-    "## Recently Emerging Interests",
-    "",
-    "_Reserved for phase-two holdout and daily ingestion comparisons._",
-    "",
-    "## Deferred Media Inspection",
-    "",
-    ...(deferred.length ? deferred.map((item) => `- ${item}`) : ["_No sources deferred for media inspection yet._"]),
-    "",
-  ].join("\n");
   const mapPath = join(config.managedRoot, "wiki", "meta", "interest-map.md");
+  const existing = parseInterestMapMarkdown(await readTextIfExists(mapPath));
+  const rawPathBySourceId = new Map(rows.map((row) => [String(row.source_id), String(row.raw_path)]));
+  const built = buildInterestMapEntries(rows.map((row) => ({
+    source_id: String(row.source_id),
+    raw_path: String(row.raw_path),
+    status: String(row.status),
+    why_saved: row.why_saved,
+    matched_interests_json: row.matched_interests_json,
+    non_obvious_connections_json: row.non_obvious_connections_json,
+    actions_json: row.actions_json,
+    confidence: row.confidence,
+    defer_reason: row.defer_reason,
+  })), existing);
+  const markdown = renderInterestMap({
+    generatedAt: new Date().toISOString(),
+    revisionLabel,
+    sourceCount: rows.length,
+    entries: built.entries,
+    recurringQuestions: built.recurringQuestions,
+    deferredMediaInspection: built.deferredMediaInspection,
+    rawPathBySourceId,
+  });
   await writeTextAtomic(mapPath, markdown);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS kb_interest_map_revisions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      revision_label TEXT,
-      markdown_path TEXT NOT NULL,
-      summary_json TEXT,
-      source_count INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-  `);
+  ensureInterestMapTables(db);
+  upsertInterestMapEntries(db, built.entries);
   db.query(`
     INSERT INTO kb_interest_map_revisions (revision_label, markdown_path, summary_json, source_count, created_at)
     VALUES (?, ?, ?, ?, ?)
-  `).run(revisionLabel, toPosixRelative(config.managedRoot, mapPath), JSON.stringify(revisionSummary), rows.length, new Date().toISOString());
+  `).run(revisionLabel, toPosixRelative(config.managedRoot, mapPath), JSON.stringify(built.summary), rows.length, new Date().toISOString());
   db.close();
+  const verify = await verifyInterestMap(config, `interest-map-refresh-${revisionLabel}`);
+  if (!verify.ok) throw new Error(`Interest map verifier failed after refresh: ${verify.errorCount} error(s). See ${verify.artifactPaths.join(", ")}`);
   return mapPath;
 }
 
@@ -376,30 +337,6 @@ function decisionStatus(decision: KbSensemakingDecision): string {
   return "processed";
 }
 
-function renderInterest(interest: string, items: Array<{ sourceId: string; rawPath: string; why: string; match: MatchedInterest }>): string[] {
-  const description = cleanGeneratedText(items[0]?.match.evidence || "Inferred from baseline sources.");
-  const signals = items.slice(0, 3).map((item) => cleanGeneratedText(item.why || item.match.evidence)).filter(Boolean).join("; ");
-  return [
-    `### ${interest}`,
-    "",
-    `- Description: ${description}`,
-    `- Signals: ${signals}`,
-    "- Related pages: ",
-    `- Example sources: ${items.slice(0, 5).map((item) => `[${item.sourceId}](../../${item.rawPath})`).join(", ")}`,
-    "",
-  ];
-}
-
-function parseJsonArray<T>(value: string | null | undefined): T[] {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed as T[] : [];
-  } catch {
-    return [];
-  }
-}
-
 function normalizeMatchedInterest(value: unknown): MatchedInterest {
   const record = recordValue(value);
   return {
@@ -428,33 +365,6 @@ function normalizeAction(value: unknown): SensemakingAction | undefined {
     summary: cleanOptionalText(record.summary),
     evidence: cleanOptionalText(record.evidence),
   };
-}
-
-function inferredInterestsFromActions(actions: SensemakingAction[], whySaved: string | undefined): MatchedInterest[] {
-  return actions
-    .filter((action) => action.kind === "create_new_page" || action.kind === "add_evidence_to_page")
-    .map((action) => action.title ?? action.page?.split("/").pop()?.replace(/\.md$/, "").replaceAll("-", " "))
-    .filter((interest): interest is string => usefulInterestName(interest))
-    .slice(0, 3)
-    .map((interest) => ({
-      interest,
-      evidence: whySaved ?? "Inferred from the proposed sensemaking action.",
-      confidence: "medium",
-    }));
-}
-
-function usefulInterestName(value: string | undefined): value is string {
-  if (!value?.trim()) return false;
-  const normalized = value.trim().toLowerCase();
-  return !(
-    normalized.startsWith("no strong")
-    || normalized.startsWith("no core")
-    || normalized.startsWith("no existing")
-    || normalized.startsWith("no clear")
-    || normalized.startsWith("no matched")
-    || normalized.includes("no strong existing")
-    || normalized.includes("no core interest")
-  );
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -489,18 +399,4 @@ function confidenceValue(value: unknown): "low" | "medium" | "high" {
 function cleanOptionalText(value: unknown): string | undefined {
   const text = stringValue(value);
   return text ? cleanGeneratedText(text) : undefined;
-}
-
-function cleanGeneratedText(value: string): string {
-  return value
-    .replace(/^#+\s*(Source Understanding|Why John Likely Saved This|Existing Interest Matches|Non-Obvious Connections|Durable Takeaways|Proposed Actions|Confidence And Deferrals)\s*/i, "")
-    .replace(/^\s*-\s*#+\s*(Source Understanding|Why John Likely Saved This|Existing Interest Matches|Non-Obvious Connections|Durable Takeaways|Proposed Actions|Confidence And Deferrals)\s*/i, "")
-    .trim();
-}
-
-function titleCaseInterest(value: string): string {
-  return value
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/\b\w/g, (char) => char.toUpperCase());
 }

@@ -7,14 +7,21 @@ import { join } from "node:path";
 import {
   applyWikiPlan,
   applySensemakingDecision,
+  buildSensemakingPrompt,
   buildReviewPages,
+  buildPriorDecisionContext,
   buildContextBundle,
+  compactInterestMapSignal,
   lintWiki,
+  reconcileInterestMap,
+  readSelectedBookmarkAt,
   refreshInterestMap,
   selectBatch,
+  verifyInterestMap,
 } from "../.nanoboss/procedures/xbookmarks/lib/index.ts";
 import wikiRefresh from "../.nanoboss/procedures/xbookmarks/wiki-refresh.ts";
 import wikiBaselineBuild from "../.nanoboss/procedures/xbookmarks/wiki-baseline-build.ts";
+import wikiBaselineReplay from "../.nanoboss/procedures/xbookmarks/wiki-baseline-replay.ts";
 import wikiTopicSynthesisRefresh from "../.nanoboss/procedures/xbookmarks/wiki-topic-synthesis-refresh.ts";
 import type { KbSensemakingDecision, WikiIngestPlan, XBookmarksConfig } from "../.nanoboss/procedures/xbookmarks/lib/types.ts";
 
@@ -464,8 +471,82 @@ test("interest map refresh groups matched interests from stored decisions", asyn
 
   const mapPath = await refreshInterestMap(config, "fixture");
   const map = await readFile(mapPath, "utf8");
-  expect(map).toContain("### Agent Harness Evaluation");
+  expect(map).toContain("### agent-harness-evaluation");
+  expect(map).toContain("- Name: Agent Harness Evaluation");
+  expect(map).toContain("- Status: emerging");
   expect(map).toContain("[123](../../raw/x/inbox/123.md)");
+
+  const db = new Database(config.databasePath!);
+  const entry = db.query("SELECT interest_id, name, source_count FROM kb_interest_map_entries WHERE interest_id = 'agent-harness-evaluation'").get() as Record<string, string | number>;
+  const revision = db.query("SELECT summary_json FROM kb_interest_map_revisions ORDER BY id DESC LIMIT 1").get() as Record<string, string>;
+  expect(entry.name).toBe("Agent Harness Evaluation");
+  expect(entry.source_count).toBe(1);
+  expect(JSON.parse(revision.summary_json).interests[0].interest_id).toBe("agent-harness-evaluation");
+  db.close();
+});
+
+test("interest map verifier writes artifacts and reconcile dry run parses manual edits", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-map-verify",
+  });
+  await refreshInterestMap(config, "fixture-verify");
+
+  const verify = await verifyInterestMap(config, "fixture-verify-run");
+  expect(verify.ok).toBe(true);
+  expect(verify.artifactPaths.some((path) => path.endsWith("interest-map-verify.json"))).toBe(true);
+
+  const mapPath = join(managedRoot, "wiki", "meta", "interest-map.md");
+  const map = await readFile(mapPath, "utf8");
+  await writeFile(mapPath, map.replace("- Aliases: none", "- Aliases: coding harnesses, eval loops"), "utf8");
+  const reconcile = await reconcileInterestMap(config, true);
+  expect(reconcile.parsedEntries).toBe(1);
+  expect(reconcile.aliasChangedInterestIds).toEqual(["agent-harness-evaluation"]);
+  expect(reconcile.applied).toBe(false);
+});
+
+test("prior-decision retrieval returns compact deterministic context", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-prior",
+  });
+  await refreshInterestMap(config, "fixture-prior");
+  await writeFile(join(managedRoot, "raw", "x", "inbox", "124.md"), rawBookmark().replaceAll("123", "124").replace("durable eval loops", "agent harness evaluation context"), "utf8");
+  const next = await readSelectedBookmarkAt(join(managedRoot, "raw", "x", "inbox", "124.md"));
+  const map = await readFile(join(managedRoot, "wiki", "meta", "interest-map.md"), "utf8");
+  const prior = await buildPriorDecisionContext(config, next, map, 12);
+  expect(prior.items.map((item) => item.source_id)).toContain("123");
+  expect(prior.markdown).toContain("[123](../../raw/x/inbox/123.md)");
+});
+
+test("sensemaking prompt keeps interest map in the stable prefix before source-specific content", () => {
+  const prompt = buildSensemakingPrompt({
+    sourceId: "123",
+    sourcePath: "/tmp/123.md",
+    sourceMarkdown: "# Source\n\nvariable source text",
+    interestMapMarkdown: "# Interest Map\n\nstable map text",
+    candidatePages: [{ path: "wiki/concepts/agent-harness-eval-loops.md" }],
+    priorDecisionContext: { markdown: "prior decision context", items: [] },
+  });
+
+  expect(prompt.indexOf("## interest-map.md")).toBeGreaterThan(0);
+  expect(prompt.indexOf("## interest-map.md")).toBeLessThan(prompt.indexOf("Current source:"));
+  expect(prompt.indexOf("Current source:")).toBeLessThan(prompt.indexOf("## source.md"));
+});
+
+test("interest map signal compaction removes repeated saved-this framing", () => {
+  expect(compactInterestMapSignal("John likely saved this because it names eval loops as a control layer.")).toBe("names eval loops as a control layer");
+  expect(compactInterestMapSignal("The save may reflect interest in AI-native hardware positioning.")).toBe("AI-native hardware positioning");
 });
 
 test("baseline build previews selected split sources without storing decisions", async () => {
@@ -499,6 +580,182 @@ test("baseline build previews selected split sources without storing decisions",
   expect(data.decisionsStored).toBe(0);
   expect(await readFile(data.runReportPath, "utf8")).toContain("Sources processed: 1");
   expect(calls.length).toBe(1);
+});
+
+test("baseline replay writes comparison artifacts without mutating stored decisions", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-replay-original",
+  });
+  await refreshInterestMap(config, "fixture-replay-map");
+  const splitPath = join(managedRoot, "wiki", "meta", "corpus-split.json");
+  await mkdir(join(managedRoot, "wiki", "meta"), { recursive: true });
+  await writeFile(splitPath, JSON.stringify({
+    baseline_100: ["123"],
+    baseline_100_sources: [{ source_id: "123", raw_path: "raw/x/inbox/123.md" }],
+  }), "utf8");
+
+  const result = await wikiBaselineReplay.execute("--split wiki/meta/corpus-split.json --limit 10 --map wiki/meta/interest-map.md --dry-run --write-comparison-report", {
+    cwd: config.workspaceRoot,
+    assertNotCancelled() {},
+    ui: { status() {} },
+    agent: {
+      async run(_prompt, descriptor) {
+        const data = { decisions: [{ source_id: "123", decision: fixtureDecision() }] };
+        if (!descriptor.validate(data)) throw new Error("fixture agent returned invalid typed data");
+        return { data, tokenUsage: { cacheReadTokens: 10, cacheWriteTokens: 20 } };
+      },
+    },
+  });
+
+  expect(typeof result).toBe("object");
+  if (!result || typeof result !== "object" || !("data" in result)) throw new Error("missing procedure data");
+  const data = result.data as { decisionsPath: string; comparisonJsonPath: string; comparisonMdPath: string };
+  expect(await readFile(data.decisionsPath, "utf8")).toContain('"why_saved"');
+  const comparisonJson = await readFile(data.comparisonJsonPath, "utf8");
+  expect(comparisonJson).toContain('"dryRun": true');
+  expect(comparisonJson).toContain('"modelCalls": 1');
+  expect(comparisonJson).toContain('"providerCacheReadTokens": 10');
+  expect(await readFile(data.comparisonMdPath, "utf8")).toContain("Mode: dry-run");
+
+  const db = new Database(config.databasePath!);
+  const count = db.query("SELECT count(*) AS count FROM kb_ingest_decisions").get() as { count: number };
+  const status = db.query("SELECT status FROM kb_ingest_decisions WHERE source_id = '123'").get() as { status: string };
+  expect(count.count).toBe(1);
+  expect(status.status).toBe("processed");
+  db.close();
+});
+
+test("baseline replay batches 100 sources five per model call and writes per-source comparison records", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  const ids = Array.from({ length: 100 }, (_item, index) => String(123 + index));
+  for (const id of ids.slice(1)) {
+    await writeFile(join(managedRoot, "raw", "x", "inbox", `${id}.md`), rawBookmark().replaceAll("123", id), "utf8");
+  }
+  const selected = (await selectBatch({ managedRoot, limit: 1 }))[0];
+  await applySensemakingDecision({
+    config,
+    selected,
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-replay-batch-original",
+  });
+  await refreshInterestMap(config, "fixture-replay-batch-map");
+  const splitPath = join(managedRoot, "wiki", "meta", "corpus-split.json");
+  await mkdir(join(managedRoot, "wiki", "meta"), { recursive: true });
+  await writeFile(splitPath, JSON.stringify({
+    baseline_100: ids,
+    baseline_100_sources: ids.map((id) => ({ source_id: id, raw_path: `raw/x/inbox/${id}.md` })),
+  }), "utf8");
+
+  const calls: string[] = [];
+  const result = await wikiBaselineReplay.execute("--split wiki/meta/corpus-split.json --limit 100 --map wiki/meta/interest-map.md --batch-size 5 --dry-run --write-comparison-report", {
+    cwd: config.workspaceRoot,
+    assertNotCancelled() {},
+    ui: { status() {} },
+    agent: {
+      async run(prompt, descriptor) {
+        calls.push(prompt);
+        const sourceIds = [...prompt.matchAll(/"sourceId": "([^"]+)"/g)].map((match) => match[1]);
+        const data = {
+          decisions: sourceIds.map((sourceId) => ({ source_id: sourceId, decision: fixtureDecisionFor(sourceId) })),
+        };
+        if (!descriptor.validate(data)) throw new Error("fixture agent returned invalid typed data");
+        return { data };
+      },
+    },
+  });
+
+  expect(calls.length).toBe(20);
+  expect(typeof result).toBe("object");
+  if (!result || typeof result !== "object" || !("data" in result)) throw new Error("missing procedure data");
+  const data = result.data as { decisionsPath: string; comparisonJsonPath: string };
+  const decisionLines = (await readFile(data.decisionsPath, "utf8")).trim().split("\n");
+  expect(decisionLines.length).toBe(100);
+  const comparison = JSON.parse(await readFile(data.comparisonJsonPath, "utf8")) as { records: unknown[]; measurement: { modelCalls: number; sourcesPerCall: number[]; mapTokenReductionFactor: number } };
+  expect(comparison.records.length).toBe(100);
+  expect(comparison.measurement.modelCalls).toBe(20);
+  expect(comparison.measurement.sourcesPerCall).toEqual(Array.from({ length: 20 }, () => 5));
+  expect(comparison.measurement.mapTokenReductionFactor).toBe(5);
+
+  const db = new Database(config.databasePath!);
+  const count = db.query("SELECT count(*) AS count FROM kb_ingest_decisions").get() as { count: number };
+  expect(count.count).toBe(1);
+  db.close();
+});
+
+test("baseline replay rejects incomplete batch output", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  await writeFile(join(managedRoot, "raw", "x", "inbox", "124.md"), rawBookmark().replaceAll("123", "124"), "utf8");
+  await applySensemakingDecision({
+    config,
+    selected: (await selectBatch({ managedRoot, limit: 1 }))[0],
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-replay-validation-original",
+  });
+  await refreshInterestMap(config, "fixture-replay-validation-map");
+  const splitPath = join(managedRoot, "wiki", "meta", "corpus-split.json");
+  await mkdir(join(managedRoot, "wiki", "meta"), { recursive: true });
+  await writeFile(splitPath, JSON.stringify({
+    baseline_100: ["123", "124"],
+    baseline_100_sources: [
+      { source_id: "123", raw_path: "raw/x/inbox/123.md" },
+      { source_id: "124", raw_path: "raw/x/inbox/124.md" },
+    ],
+  }), "utf8");
+
+  await expect(wikiBaselineReplay.execute("--split wiki/meta/corpus-split.json --limit 2 --map wiki/meta/interest-map.md --batch-size 2 --dry-run --write-comparison-report", {
+    cwd: config.workspaceRoot,
+    assertNotCancelled() {},
+    ui: { status() {} },
+    agent: {
+      async run(_prompt, descriptor) {
+        const data = { decisions: [{ source_id: "123", decision: fixtureDecision() }] };
+        if (!descriptor.validate(data)) throw new Error("fixture agent returned invalid typed data");
+        return { data };
+      },
+    },
+  })).rejects.toThrow("exactly one decision per selected source");
+});
+
+test("baseline replay enforces exact token budget before agent calls", async () => {
+  const { config, managedRoot } = await createFixtureWiki();
+  await applySensemakingDecision({
+    config,
+    selected: (await selectBatch({ managedRoot, limit: 1 }))[0],
+    decision: fixtureDecision(),
+    dryRun: false,
+    runId: "fixture-replay-budget-original",
+  });
+  await refreshInterestMap(config, "fixture-replay-budget-map");
+  const splitPath = join(managedRoot, "wiki", "meta", "corpus-split.json");
+  await mkdir(join(managedRoot, "wiki", "meta"), { recursive: true });
+  await writeFile(splitPath, JSON.stringify({
+    baseline_100: ["123"],
+    baseline_100_sources: [{ source_id: "123", raw_path: "raw/x/inbox/123.md" }],
+  }), "utf8");
+  let calls = 0;
+
+  await expect(wikiBaselineReplay.execute("--split wiki/meta/corpus-split.json --limit 1 --map wiki/meta/interest-map.md --batch-size 1 --model-context-window-tokens 1 --output-reserve-per-source 1 --dry-run --write-comparison-report", {
+    cwd: config.workspaceRoot,
+    assertNotCancelled() {},
+    ui: { status() {} },
+    agent: {
+      async run(_prompt, descriptor) {
+        calls += 1;
+        const data = { decisions: [{ source_id: "123", decision: fixtureDecision() }] };
+        if (!descriptor.validate(data)) throw new Error("fixture agent returned invalid typed data");
+        return { data };
+      },
+    },
+  })).rejects.toThrow("static prefix tokens");
+  expect(calls).toBe(0);
 });
 
 
@@ -654,6 +911,16 @@ function fixtureDecision(): KbSensemakingDecision {
       },
     ],
     confidence: "high",
+  };
+}
+
+function fixtureDecisionFor(sourceId: string): KbSensemakingDecision {
+  return {
+    ...fixtureDecision(),
+    source_understanding: {
+      ...fixtureDecision().source_understanding,
+      source_id: sourceId,
+    },
   };
 }
 

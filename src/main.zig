@@ -2112,6 +2112,19 @@ fn applyMigrations(db: *Db) !void {
         \\  source_count INTEGER NOT NULL DEFAULT 0,
         \\  created_at TEXT NOT NULL
         \\);
+        \\CREATE TABLE IF NOT EXISTS kb_interest_map_entries (
+        \\  interest_id TEXT PRIMARY KEY,
+        \\  name TEXT NOT NULL,
+        \\  description TEXT,
+        \\  status TEXT NOT NULL,
+        \\  aliases_json TEXT,
+        \\  parent_interest_id TEXT,
+        \\  example_sources_json TEXT,
+        \\  source_count INTEGER NOT NULL DEFAULT 0,
+        \\  confidence_json TEXT,
+        \\  created_at TEXT NOT NULL,
+        \\  updated_at TEXT NOT NULL
+        \\);
         \\CREATE INDEX IF NOT EXISTS idx_bookmark_items_last_seen ON bookmark_items(account_user_id, last_seen_run_id);
         \\CREATE INDEX IF NOT EXISTS idx_media_assets_status ON media_assets(status);
         \\CREATE INDEX IF NOT EXISTS idx_thread_expansions_status ON thread_expansions(status);

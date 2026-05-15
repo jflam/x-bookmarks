@@ -55,6 +55,7 @@ export default {
             sourcePath: selected.rawPath,
             sourceMarkdown: context.sourceMarkdown,
             interestMapMarkdown: context.interestMapMarkdown,
+            priorDecisionContext: context.priorDecisionContext,
             candidatePages: context.candidatePages,
           }),
           KbSensemakingDecisionType,
@@ -113,7 +114,7 @@ function parseRequest(prompt: string): { split: string; limit: number; dryRun: b
   let split = "";
   let limit = 100;
   let dryRun = true;
-  let batchSize = 10;
+  let batchSize = 5;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (part === "--split") split = parts[++index] ?? "";

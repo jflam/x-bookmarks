@@ -1,6 +1,10 @@
 import { jsonType } from "./nanoboss.ts";
 import type { KbSensemakingDecision, RefreshIntent, TopicSynthesisIntent, WikiIngestPlan, WikiOperation } from "./types.ts";
 
+export interface KbSensemakingDecisionBatch {
+  decisions: Array<{ source_id: string; decision: KbSensemakingDecision }>;
+}
+
 export const RefreshIntentType = jsonType<RefreshIntent>(
   {
     type: "object",
@@ -82,6 +86,17 @@ export const KbSensemakingDecisionType = jsonType<KbSensemakingDecision>(
   isKbSensemakingDecision,
 );
 
+export const KbSensemakingDecisionBatchType = jsonType<KbSensemakingDecisionBatch>(
+  {
+    type: "object",
+    required: ["decisions"],
+    properties: {
+      decisions: { type: "array" },
+    },
+  },
+  isKbSensemakingDecisionBatch,
+);
+
 function isRefreshIntent(value: unknown): value is RefreshIntent {
   if (!isRecord(value)) return false;
   return (
@@ -137,6 +152,15 @@ function isKbSensemakingDecision(value: unknown): value is KbSensemakingDecision
     && enumValue(value.confidence, ["low", "medium", "high"])
     && optionalString(value.defer_reason)
   );
+}
+
+function isKbSensemakingDecisionBatch(value: unknown): value is KbSensemakingDecisionBatch {
+  if (!isRecord(value) || !Array.isArray(value.decisions)) return false;
+  return value.decisions.every((item) => (
+    isRecord(item)
+    && typeof item.source_id === "string"
+    && isKbSensemakingDecision(item.decision)
+  ));
 }
 
 function isWikiOperation(value: unknown): value is WikiOperation {

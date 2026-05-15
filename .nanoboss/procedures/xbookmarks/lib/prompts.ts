@@ -80,7 +80,15 @@ export function buildSensemakingPrompt(params: {
   sourceMarkdown: string;
   interestMapMarkdown: string;
   candidatePages: Array<{ path: string; title?: string; excerpt?: string }>;
+  priorDecisionContext?: { markdown: string; items: unknown[] };
 }): string {
+  return [
+    buildSensemakingStaticPrefix({ interestMapMarkdown: params.interestMapMarkdown }),
+    buildSensemakingSourcePayload(params),
+  ].join("\n");
+}
+
+export function buildSensemakingStaticPrefix(params: { interestMapMarkdown: string; batchPolicy?: string }): string {
   return [
     "You are doing phase-one interest-aware X bookmark sensemaking.",
     "Answer the product question: why did John likely save this, and what does it connect to?",
@@ -102,13 +110,62 @@ export function buildSensemakingPrompt(params: {
     "Allowed action kinds: create_new_page, add_evidence_to_page, create_or_update_open_question, defer_for_media_inspection, ignore_low_signal.",
     "For image-primary, video-primary, chart, or screenshot sources where text is insufficient, set source_understanding.requires_media_inspection true and include defer_reason.",
     "",
+    markdownBlock("interest-map.md", params.interestMapMarkdown || "_No interest map exists yet._"),
+    params.batchPolicy ? ["## Batch Policy", "", params.batchPolicy, ""].join("\n") : undefined,
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+export function buildSensemakingSourcePayload(params: {
+  sourceId: string;
+  sourcePath: string;
+  sourceMarkdown: string;
+  candidatePages: Array<{ path: string; title?: string; excerpt?: string }>;
+  priorDecisionContext?: { markdown: string; items: unknown[] };
+}): string {
+  return [
     "Current source:",
     JSON.stringify({ sourceId: params.sourceId, sourcePath: params.sourcePath }, null, 2),
     "",
-    markdownBlock("interest-map.md", params.interestMapMarkdown || "_No interest map exists yet._"),
+    markdownBlock("prior-decisions.md", params.priorDecisionContext?.markdown || "_No deterministic prior decisions retrieved._"),
     jsonBlock("candidate-pages.json", JSON.stringify(params.candidatePages, null, 2)),
     markdownBlock("source.md", params.sourceMarkdown),
   ].join("\n");
+}
+
+export function buildBatchSensemakingPrompt(params: {
+  interestMapMarkdown: string;
+  sources: Array<{
+    sourceId: string;
+    sourcePath: string;
+    sourceMarkdown: string;
+    candidatePages: Array<{ path: string; title?: string; excerpt?: string }>;
+    priorDecisionContext?: { markdown: string; items: unknown[] };
+  }>;
+}): { prompt: string; staticPrefix: string; batchPayload: string } {
+  const staticPrefix = buildSensemakingStaticPrefix({
+    interestMapMarkdown: params.interestMapMarkdown,
+    batchPolicy: [
+      "Return a JSON object with a decisions array.",
+      "The array must contain exactly one decision per source listed below.",
+      "Each item must have source_id matching the source and decision matching KbSensemakingDecision.",
+      "Normalize each source independently; do not let one source's decision contaminate another source.",
+    ].join("\n"),
+  });
+  const batchPayload = [
+    "Batch sources:",
+    "",
+    ...params.sources.flatMap((source, index) => [
+      `### Source ${index + 1}: ${source.sourceId}`,
+      "",
+      buildSensemakingSourcePayload(source),
+      "",
+    ]),
+  ].join("\n");
+  return {
+    prompt: [staticPrefix, batchPayload].join("\n"),
+    staticPrefix,
+    batchPayload,
+  };
 }
 
 function readPromptModule(name: string): string {
